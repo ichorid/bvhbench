@@ -21,7 +21,7 @@ def perturbate_point(point, coeff=0.1):
     return tuple(point[d]*(1.0 + random.uniform(-coeff/2, coeff/2)) for d in dims)
 
 
-# testset = tuple(gen_random_point() for _ in xrange(set_size))
+#testset = tuple(gen_random_point() for _ in xrange(set_size))
 testset = HAND
 enumed = enumerate(testset)
 
@@ -72,7 +72,7 @@ def calc_random(testset_sorted, d):
     return int(random.uniform(0, len(testset_sorted)))
 
 
-def voxelize(pointset, criterion=calc_median, depth=-1, max_leaf_size=32):
+def voxelize(pointset, criterion=calc_median, depth=-1, max_leaf_size=1):
     d = (depth + 1) % len(dims)
     if len(pointset) <= max_leaf_size:
         return pointset
@@ -115,7 +115,7 @@ def find_node_by_point_tree(tree, point, depth=-1):
 
 def main():
     #testpoints = [gen_random_point() for _ in xrange(0, 100)]
-    testpoints = [perturbate_point(p,0.01) for p in random.sample(HAND, 10000)]
+    testpoints = [perturbate_point(p,0.0) for p in random.sample(testset, 10000)]
 
     for criterion in (calc_median, calc_SAH, calc_random):
         print criterion.__name__
