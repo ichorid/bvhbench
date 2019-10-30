@@ -1,8 +1,10 @@
 import pickle
 import random
 from timeit import default_timer as timer
+import gzip
 
-with open("hand_small.pickle", 'rb') as f:
+
+with gzip.open("hand_small.pickle.gz", 'rb') as f:
     HAND = pickle.load(f)
 
 set_size = 100000
@@ -14,6 +16,9 @@ random.seed(123)
 
 def gen_random_point(a=-1.0, b=1.0):
     return tuple(random.uniform(a, b) for _ in dims)
+
+def perturbate_point(point, coeff=0.1):
+    return tuple(point[d]*(1.0 + random.uniform(-coeff/2, coeff/2)) for d in dims)
 
 
 # testset = tuple(gen_random_point() for _ in xrange(set_size))
@@ -62,6 +67,11 @@ def calc_SAH(points, d):
 def calc_median(testset_sorted, d):
     return len(testset_sorted) / 2
 
+
+def calc_random(testset_sorted, d):
+    return int(random.uniform(0, len(testset_sorted)))
+
+
 def voxelize(pointset, criterion=calc_median, depth=-1, max_leaf_size=32):
     d = (depth + 1) % len(dims)
     if len(pointset) <= max_leaf_size:
@@ -88,7 +98,7 @@ def find_node_by_point_tree(tree, point, depth=-1):
     # Leaf found
     if isinstance(tree[0], tuple):
         return find_node_by_point_linear(tree, point)
-        #return tree[0]
+        # return tree[0]
 
     # print d, tree[0]
     search_left = point[d] < tree[0]
@@ -104,9 +114,10 @@ def find_node_by_point_tree(tree, point, depth=-1):
 
 
 def main():
-    testpoints = [gen_random_point() for _ in xrange(0, 100)]
+    #testpoints = [gen_random_point() for _ in xrange(0, 100)]
+    testpoints = [perturbate_point(p,0.01) for p in random.sample(HAND, 10000)]
 
-    for criterion in (calc_median, calc_SAH):
+    for criterion in (calc_median, calc_SAH, calc_random):
         print criterion.__name__
         # SAH
         start = timer()
@@ -122,12 +133,12 @@ def main():
         # print found_point_tree, dist(found_point_tree, test_point)
         print "time to find point", (end - start)
 
-    #start = timer()
-    #for test_point in testpoints:
+    # start = timer()
+    # for test_point in testpoints:
     #    found_point_linear = find_node_by_point_linear(testset, test_point)
-    #end = timer()
-    #print found_point_linear, dist(found_point_linear, test_point)
-    #print (end - start)
+    # end = timer()
+    # print found_point_linear, dist(found_point_linear, test_point)
+    # print (end - start)
 
 
 if __name__ == "__main__":
