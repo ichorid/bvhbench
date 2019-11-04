@@ -2,6 +2,7 @@ import bisect
 import gzip
 import pickle
 import random
+from math import log2, floor, ceil
 from timeit import default_timer as timer
 
 
@@ -28,7 +29,6 @@ def perturbate_point(point, coeff=0.1):
 
 
 # testset = tuple(gen_random_point() for _ in xrange(set_size))
-testset = HAND
 
 
 def find_node_by_point_linear(tset, point):
@@ -122,7 +122,7 @@ MORTON_BITS_PER_DIM = 21
 
 
 def get_quadrant(point, num_cells=2 ** MORTON_BITS_PER_DIM):
-    return tuple(int(point[d] * num_cells) for d in dims)
+    return tuple(int(floor(point[d] * num_cells)) for d in dims)
 
 
 def get_morton_code(point):
@@ -130,6 +130,8 @@ def get_morton_code(point):
     for d in dims:
         point_code = 0
         for k in range(0, MORTON_BITS_PER_DIM):
+            assert (point_quadrant[d] >= 0)
+            assert (point_quadrant[d] < 2 ** MORTON_BITS_PER_DIM)
             bit_d = (point_quadrant[d] >> k) & 1
             point_code = point_code ^ (bit_d << ((len(dims) - d) + k * len(dims)))
     return point_code
@@ -145,6 +147,8 @@ def find_outliers(points):
 
 def normalize_points(points):
     outliers = find_outliers(points)
+    # We normalize to values slightly smaller that the real outliers to make sure 0.0 and 1.0 will never appear later
+    outliers = tuple((outliers[d][0] * 1.000001, outliers[d][1] * 1.000001) for d in dims)
 
     points_normalized = []
     for p in points:
@@ -158,15 +162,79 @@ def find_nearest_neighbor_morton(morton_list, point):
     return bisect.bisect_left(morton_list, morton_point)
 
 
+def radix_delta(p1, p2):
+    return clz(p1[1] ^ p2[1])
+
+
+def determine_range_direction(mpisl, index):
+    # Determine "d".
+    # Get deltas with the node to the left and to the right of the given index.
+    # If right delta is higher than the left one, return +1, otherwise -1
+    # There should never be the case where the delta is the same!
+    return 1 if (radix_delta(mpisl[index], mpisl[index + 1]) - radix_delta(mpisl[index], mpisl[index - 1])) > 0 else -1
+
+
+def compute_range_upper_bound(mpisl, index, d):
+    delta_min = radix_delta(mpisl[index], mpisl[index - d])
+    l_max = 2
+    while radix_delta(mpisl[index], mpisl[index + l_max * d]) > delta_min:
+        l_max = l_max * 2
+    return l_max
+
+
+def compute_range_end(mpisl, index, d):
+    delta_min = radix_delta(mpisl[index], mpisl[index - d])
+    l_max = compute_range_upper_bound(mpisl, index, d)
+    l = 0
+    # Binary search
+    for t in [int(l_max / (2 ** n)) for n in reversed(range(0, int(log2(l_max))))]:
+        if radix_delta(mpisl[index], mpisl[index + (l + t) * d]) > delta_min:
+            l = l + t
+    return index + l * d  # thats j in the paper pseudocode
+
+
+def find_split_position(mpisl, index, d):
+    range_end = compute_range_end(mpisl, index, d)
+    l = abs(index - range_end)
+    delta_node = radix_delta(mpisl[index], mpisl[range_end])
+    s = 0
+    for t in [int(ceil(l / (2 ** n))) for n in reversed(range(0, int(log2(l))))]:
+        if radix_delta(mpisl[index], mpisl[index + (s + t) * d]) > delta_node:
+            s = s + t
+    return index + s * d + min(d, 0)  # thats gamma in the paper
+
+
+def compact_duplicates(mpisl):
+    new_list = [mpisl[0]]
+    for e in mpisl:
+        if new_list[-1][1] != e[1]:
+            new_list.append(e)
+        else:
+            new_list[-1][0].append(e[1][0])
+    return new_list
+
+
+def construct_binary_radix_tree(pl):
+    mortonized_points = tuple(get_morton_code(p) for p in pl)
+    mortonized_points_indexed = enumerate(mortonized_points)
+    mpi_sorted = sorted(mortonized_points_indexed, key=lambda x: x[1])
+    mpi_sorted_compacted = compact_duplicates(mpi_sorted)
+    print(len(mpi_sorted), len(mpi_sorted_compacted))
+
+    # for i in range(1,100):
+    #    print(radix_delta(mpi_sorted[i-1][1], mpi_sorted[i][1]))
+
+
 def main():
     # testpoints = [gen_random_point() for _ in xrange(0, 100)]
     testset = normalize_points(HAND)
     # testset = HAND
     testpoints = [perturbate_point(p, 0.0) for p in random.sample(testset, 10000)]
-    mortonized_points = tuple(get_morton_code(p) for p in testpoints)
-    mortonized_points_sorted = sorted(mortonized_points)
-    m_point = mortonized_points_sorted[find_nearest_neighbor_morton(mortonized_points_sorted, testpoints[10])]
-    print(mortonized_points.index(m_point))
+    construct_binary_radix_tree(testset)
+
+    # mortonized_points_sorted = sorted(mortonized_points)
+    # m_point = mortonized_points_sorted[find_nearest_neighbor_morton(mortonized_points_sorted, testpoints[10])]
+    # print(mortonized_points.index(m_point))
 
     for criterion in (calc_median, calc_SAH, calc_random):
         print(criterion.__name__)
