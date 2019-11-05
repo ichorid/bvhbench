@@ -3,6 +3,7 @@ import gzip
 import pickle
 import random
 from math import log2, floor, ceil
+from pprint import pprint
 from timeit import default_timer as timer
 
 
@@ -42,6 +43,7 @@ def find_node_by_point_linear(tset, point):
     return best_match
 
 
+# UNUSED
 def voxelize_to_point_tuples_tree(pointset, depth=0, max_leaf_size=1):
     d = (depth + 1) % len(dims)
     if len(pointset) <= max_leaf_size:
@@ -162,55 +164,71 @@ def find_nearest_neighbor_morton(morton_list, point):
     return bisect.bisect_left(morton_list, morton_point)
 
 
-def radix_delta(p1, p2):
-    return clz(p1[1] ^ p2[1])
-
-
-def determine_range_direction(mpisl, index):
-    # Determine "d".
-    # Get deltas with the node to the left and to the right of the given index.
-    # If right delta is higher than the left one, return +1, otherwise -1
-    # There should never be the case where the delta is the same!
-    return 1 if (radix_delta(mpisl[index], mpisl[index + 1]) - radix_delta(mpisl[index], mpisl[index - 1])) > 0 else -1
+def radix_delta(mpisl, i1, i2):
+    if 0 <= i1 < len(mpisl) and 0 <= i2 < len(mpisl):
+        return clz(mpisl[i1][1] ^ mpisl[i2][1])
+    else:
+        return -1
 
 
 def compute_range_upper_bound(mpisl, index, d):
-    delta_min = radix_delta(mpisl[index], mpisl[index - d])
+    delta_min = radix_delta(mpisl, index, index - d)
     l_max = 2
-    while radix_delta(mpisl[index], mpisl[index + l_max * d]) > delta_min:
+    while radix_delta(mpisl, index, index + l_max * d) > delta_min:
         l_max = l_max * 2
     return l_max
 
 
-def compute_range_end(mpisl, index, d):
-    delta_min = radix_delta(mpisl[index], mpisl[index - d])
-    l_max = compute_range_upper_bound(mpisl, index, d)
-    l = 0
-    # Binary search
-    for t in [int(l_max / (2 ** n)) for n in reversed(range(0, int(log2(l_max))))]:
-        if radix_delta(mpisl[index], mpisl[index + (l + t) * d]) > delta_min:
+def calculate_node_properties(mpisl, i):
+    # Determine "d".
+    # Get deltas with the node to the left and to the right of the given i.
+    # If right delta is higher than the left one, return +1, otherwise -1
+    # There should never be the case where the delta is the same!
+    d = 1 if (radix_delta(mpisl, i, i + 1) - radix_delta(mpisl, i, i - 1)) > 0 else -1
+
+    # Compute range end using binary search
+    delta_min = radix_delta(mpisl, i, i - d)
+    l_max = compute_range_upper_bound(mpisl, i, d)
+    l = 0  # the length of the node domain in direction d
+    for t in [int(l_max / (2 ** n)) for n in range(1, int(log2(l_max) + 1))]:
+        if radix_delta(mpisl, i, i + (l + t) * d) > delta_min:
             l = l + t
-    return index + l * d  # thats j in the paper pseudocode
+    j = i + l * d  # range end
 
-
-def find_split_position(mpisl, index, d):
-    range_end = compute_range_end(mpisl, index, d)
-    l = abs(index - range_end)
-    delta_node = radix_delta(mpisl[index], mpisl[range_end])
+    # Find split position using binary search
+    delta_node = radix_delta(mpisl, i, j)
     s = 0
-    for t in [int(ceil(l / (2 ** n))) for n in reversed(range(0, int(log2(l))))]:
-        if radix_delta(mpisl[index], mpisl[index + (s + t) * d]) > delta_node:
+    for t in [int(ceil(l / (2 ** n))) for n in range(1, int(log2(l or 1) + 1))]:
+        if radix_delta(mpisl, i, i + (s + t) * d) > delta_node:
             s = s + t
-    return index + s * d + min(d, 0)  # thats gamma in the paper
+    gamma = i + s * d + min(d, 0)  # split position
+    # print(i, j, l_max * d, gamma)
+    assert (i <= gamma <= j or j <= gamma <= i)
+    return j, gamma
+
+
+def voxelize_to_point_tuples_tree_by_morton_radix(mpisl, i):
+    j, g = calculate_node_properties(mpisl, i)
+    if min(i, j) == g:
+        return mpisl[g]  # left leaf
+    if max(i, j) == g + 1:
+        return mpisl[g + 1]  # right leaf
+    # print(i, j, g)
+    # return (mpisl[g] if min(i, j) == g else voxelize_to_point_tuples_tree_by_morton_radix(mpisl, g),
+    #        mpisl[g + 1] if max(i, j) == (g + 1) else voxelize_to_point_tuples_tree_by_morton_radix(mpisl, g + 1))
+
+    return (morton2point(mpisl[g][1]), # GET DIMENSION !!!!
+            voxelize_to_point_tuples_tree_by_morton_radix(mpisl, g),
+            voxelize_to_point_tuples_tree_by_morton_radix(mpisl, g + 1))
 
 
 def compact_duplicates(mpisl):
-    new_list = [mpisl[0]]
+    new_list = []
     for e in mpisl:
-        if new_list[-1][1] != e[1]:
-            new_list.append(e)
+        if not new_list or new_list[-1][1] != e[1]:
+            new_list.append([[e[0]], e[1]])
         else:
-            new_list[-1][0].append(e[1][0])
+            new_list[-1][0].append(e[0])
     return new_list
 
 
@@ -220,6 +238,11 @@ def construct_binary_radix_tree(pl):
     mpi_sorted = sorted(mortonized_points_indexed, key=lambda x: x[1])
     mpi_sorted_compacted = compact_duplicates(mpi_sorted)
     print(len(mpi_sorted), len(mpi_sorted_compacted))
+    # for i in range(0, len(mpi_sorted_compacted) - 1):
+    #    j, g = calculate_node_properties(mpi_sorted_compacted, i)
+    #    # node = (leaf(i) if min(i,j) == g else node(g), leaf(g+1) if max(i,j) == g+1 else node(g+1))
+    mrtree = voxelize_to_point_tuples_tree_by_morton_radix(mpi_sorted_compacted, 0)
+    pprint(mrtree)
 
     # for i in range(1,100):
     #    print(radix_delta(mpi_sorted[i-1][1], mpi_sorted[i][1]))
