@@ -108,6 +108,7 @@ def find_node_by_point_tree(tree, point, depth=-1):
         # return tree[0]
 
     # print d, tree[0]
+    # print(point[d], tree[0])
     search_left = point[d] < tree[0]
     best = find_node_by_point_tree(tree[1 if search_left else 2], point, depth + 1)
     if best is None:
@@ -121,21 +122,23 @@ def find_node_by_point_tree(tree, point, depth=-1):
 
 
 MORTON_BITS_PER_DIM = 21
+num_cells = 2 ** MORTON_BITS_PER_DIM
 
 
-def get_quadrant(point, num_cells=2 ** MORTON_BITS_PER_DIM):
+def get_quadrant(point):
     return tuple(int(floor(point[d] * num_cells)) for d in dims)
 
 
 def get_morton_code(point):
     point_quadrant = get_quadrant(point)
+    point_code = 0
     for d in dims:
-        point_code = 0
         for k in range(0, MORTON_BITS_PER_DIM):
             assert (point_quadrant[d] >= 0)
             assert (point_quadrant[d] < 2 ** MORTON_BITS_PER_DIM)
             bit_d = (point_quadrant[d] >> k) & 1
-            point_code = point_code ^ (bit_d << ((len(dims) - d) + k * len(dims)))
+            point_code = point_code ^ (bit_d << (k * len(dims) + (len(dims) - 1 - d)))
+            # point_code = point_code ^ (bit_d << ((len(dims) - d) + k * len(dims)))
     return point_code
 
 
@@ -149,13 +152,17 @@ def find_outliers(points):
 
 def normalize_points(points):
     outliers = find_outliers(points)
-    # We normalize to values slightly smaller that the real outliers to make sure 0.0 and 1.0 will never appear later
-    outliers = tuple((outliers[d][0] * 1.000001, outliers[d][1] * 1.000001) for d in dims)
+
+    # We normalize to values slightly bigger that that of
+    # the real outliers to make sure 1.0 will never appear later
+    norm_coeff = tuple(1.00001 * (outliers[d][1] - outliers[d][0]) for d in dims)
 
     points_normalized = []
     for p in points:
         points_normalized.append(
-            tuple((p[d] - outliers[d][0]) / (outliers[d][1] - outliers[d][0]) for d in dims))
+            tuple((p[d] - outliers[d][0]) / norm_coeff[d] for d in dims))
+        for d in dims:
+            assert (points_normalized[-1][d] >= 0)
     return points_normalized
 
 
@@ -202,24 +209,43 @@ def calculate_node_properties(mpisl, i):
         if radix_delta(mpisl, i, i + (s + t) * d) > delta_node:
             s = s + t
     gamma = i + s * d + min(d, 0)  # split position
-    # print(i, j, l_max * d, gamma)
-    assert (i <= gamma <= j or j <= gamma <= i)
-    return j, gamma
+    print ("GAMMA CALC:", i, s, d, min(d,0) )
+    split_delta = radix_delta(mpisl, gamma, gamma + d)
+    print("BLA ", i, j, l_max * d, gamma, gamma+d)
+    assert (i <= gamma < j or j <= gamma < i)
+    return j, gamma, split_delta
 
 
-def voxelize_to_point_tuples_tree_by_morton_radix(mpisl, i):
-    j, g = calculate_node_properties(mpisl, i)
+def morton2point(mpoint):
+    point = [0, 0, 0]
+    for d in dims:
+        coordinate = 0.0
+        for i in range(0, MORTON_BITS_PER_DIM):
+            coordinate = coordinate + ((mpoint >> d) & (1 << i))
+        point[d] = coordinate / num_cells
+    return tuple(point)
+
+
+def voxelize_to_point_tuples_tree_by_morton_radix(mpisl, i, orig_points):
+    j, g, split_delta = calculate_node_properties(mpisl, i)
+
+    print(i, j, g, split_delta)
+
     if min(i, j) == g:
-        return mpisl[g]  # left leaf
-    if max(i, j) == g + 1:
-        return mpisl[g + 1]  # right leaf
-    # print(i, j, g)
-    # return (mpisl[g] if min(i, j) == g else voxelize_to_point_tuples_tree_by_morton_radix(mpisl, g),
-    #        mpisl[g + 1] if max(i, j) == (g + 1) else voxelize_to_point_tuples_tree_by_morton_radix(mpisl, g + 1))
+        left_child = [orig_points[k] for k in mpisl[g][0]]
+    else:
+        print("<<<<<")
+        left_child = voxelize_to_point_tuples_tree_by_morton_radix(mpisl, g, orig_points)
 
-    return (morton2point(mpisl[g][1]), # GET DIMENSION !!!!
-            voxelize_to_point_tuples_tree_by_morton_radix(mpisl, g),
-            voxelize_to_point_tuples_tree_by_morton_radix(mpisl, g + 1))
+    if max(i, j) == g + 1:
+        right_child = [orig_points[k] for k in mpisl[g + 1][0]]
+    else:
+        print(">>>>>")
+        right_child = voxelize_to_point_tuples_tree_by_morton_radix(mpisl, g + 1, orig_points)
+
+    assert (split_delta >= 0)  # this should never happen, as we handle leaves on upper layers
+    split_position = morton2point(mpisl[g][1])[len(dims) - (split_delta % len(dims))]
+    return split_position, left_child, right_child
 
 
 def compact_duplicates(mpisl):
@@ -241,39 +267,67 @@ def construct_binary_radix_tree(pl):
     # for i in range(0, len(mpi_sorted_compacted) - 1):
     #    j, g = calculate_node_properties(mpi_sorted_compacted, i)
     #    # node = (leaf(i) if min(i,j) == g else node(g), leaf(g+1) if max(i,j) == g+1 else node(g+1))
-    mrtree = voxelize_to_point_tuples_tree_by_morton_radix(mpi_sorted_compacted, 0)
-    pprint(mrtree)
+    pprint(pl)
+    mrtree = voxelize_to_point_tuples_tree_by_morton_radix(mpi_sorted_compacted, 0, pl)
 
     # for i in range(1,100):
     #    print(radix_delta(mpi_sorted[i-1][1], mpi_sorted[i][1]))
+    return mrtree
 
 
 def main():
     # testpoints = [gen_random_point() for _ in xrange(0, 100)]
-    testset = normalize_points(HAND)
+    testset = normalize_points(random.sample(HAND, 4))
     # testset = HAND
-    testpoints = [perturbate_point(p, 0.0) for p in random.sample(testset, 10000)]
-    construct_binary_radix_tree(testset)
+    testpoints = [perturbate_point(p, 0.0) for p in random.sample(testset, 4)]
 
-    # mortonized_points_sorted = sorted(mortonized_points)
-    # m_point = mortonized_points_sorted[find_nearest_neighbor_morton(mortonized_points_sorted, testpoints[10])]
-    # print(mortonized_points.index(m_point))
+    point_search_results = []
 
-    for criterion in (calc_median, calc_SAH, calc_random):
+    for criterion in (calc_random, calc_SAH, calc_median):
         print(criterion.__name__)
         # SAH
         start = timer()
         tree = voxelize(testset, criterion=criterion)
         end = timer()
         print("time to build", (end - start))
-        # pprint(tree)
+
+        pprint(tree)
 
         start = timer()
+        search_results = []
         for test_point in testpoints:
-            found_point_tree = find_node_by_point_tree(tree, test_point)
+            search_results.append(find_node_by_point_tree(tree, test_point))
+        point_search_results.append(search_results)
+
         end = timer()
         # print found_point_tree, dist(found_point_tree, test_point)
         print("time to find point", (end - start))
+        print("\n")
+
+    print("morton stuff")
+    start = timer()
+    morton_tree = construct_binary_radix_tree(testset)
+    end = timer()
+    print("time to build ", (end - start))
+
+    # mortonized_points_sorted = sorted(mortonized_points)
+    # m_point = mortonized_points_sorted[find_nearest_neighbor_morton(mortonized_points_sorted, testpoints[10])]
+    # print(mortonized_points.index(m_point))
+    start = timer()
+    morton_results = []
+    for test_point in testpoints:
+        morton_results.append(find_node_by_point_tree(morton_tree, test_point))
+    point_search_results.append(morton_results)
+    end = timer()
+    print("time to find point", (end - start))
+
+    pprint(morton_tree)
+    print("\n")
+    for res in range(0, 4):
+        print(testpoints[res])
+        for c in point_search_results:
+            print(c[res])
+        print("\n")
 
     # start = timer()
     # for test_point in testpoints:
