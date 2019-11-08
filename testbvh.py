@@ -136,9 +136,11 @@ def get_morton_code(point):
         for k in range(0, MORTON_BITS_PER_DIM):
             assert (point_quadrant[d] >= 0)
             assert (point_quadrant[d] < 2 ** MORTON_BITS_PER_DIM)
-            bit_d = (point_quadrant[d] >> k) & 1
-            point_code = point_code ^ (bit_d << (k * len(dims) + (len(dims) - 1 - d)))
-            # point_code = point_code ^ (bit_d << ((len(dims) - d) + k * len(dims)))
+
+            cp = (point_quadrant[d]>>k) & 1
+            cp_shifted = cp << (len(dims) -1 -d+k*len(dims))
+            point_code = point_code ^ (cp_shifted)
+
     return point_code
 
 
@@ -209,9 +211,9 @@ def calculate_node_properties(mpisl, i):
         if radix_delta(mpisl, i, i + (s + t) * d) > delta_node:
             s = s + t
     gamma = i + s * d + min(d, 0)  # split position
-    print ("GAMMA CALC:", i, s, d, min(d,0) )
-    split_delta = radix_delta(mpisl, gamma, gamma + d)
-    print("BLA ", i, j, l_max * d, gamma, gamma+d)
+    #print("GAMMA CALC:", i, s, d, min(d, 0))
+    split_delta = radix_delta(mpisl, gamma, gamma + 1)
+    #print("BLA ", i, j, l_max * d, gamma, gamma + d, split_delta)
     assert (i <= gamma < j or j <= gamma < i)
     return j, gamma, split_delta
 
@@ -220,8 +222,8 @@ def morton2point(mpoint):
     point = [0, 0, 0]
     for d in dims:
         coordinate = 0.0
-        for i in range(0, MORTON_BITS_PER_DIM):
-            coordinate = coordinate + ((mpoint >> d) & (1 << i))
+        for k in range(0, MORTON_BITS_PER_DIM):
+            coordinate = coordinate +(((mpoint >> (len(dims) - 1 - d + k * len(dims))) & 1) << k)
         point[d] = coordinate / num_cells
     return tuple(point)
 
@@ -229,22 +231,22 @@ def morton2point(mpoint):
 def voxelize_to_point_tuples_tree_by_morton_radix(mpisl, i, orig_points):
     j, g, split_delta = calculate_node_properties(mpisl, i)
 
-    print(i, j, g, split_delta)
-
     if min(i, j) == g:
         left_child = [orig_points[k] for k in mpisl[g][0]]
     else:
-        print("<<<<<")
+        #print("<<<<<")
         left_child = voxelize_to_point_tuples_tree_by_morton_radix(mpisl, g, orig_points)
 
     if max(i, j) == g + 1:
         right_child = [orig_points[k] for k in mpisl[g + 1][0]]
     else:
-        print(">>>>>")
+        #print(">>>>>")
         right_child = voxelize_to_point_tuples_tree_by_morton_radix(mpisl, g + 1, orig_points)
 
     assert (split_delta >= 0)  # this should never happen, as we handle leaves on upper layers
-    split_position = morton2point(mpisl[g][1])[len(dims) - (split_delta % len(dims))]
+    assert (g >= 0)
+    split_position = morton2point(mpisl[g][1])[len(dims) - 1 - (split_delta % len(dims))]
+
     return split_position, left_child, right_child
 
 
@@ -267,7 +269,7 @@ def construct_binary_radix_tree(pl):
     # for i in range(0, len(mpi_sorted_compacted) - 1):
     #    j, g = calculate_node_properties(mpi_sorted_compacted, i)
     #    # node = (leaf(i) if min(i,j) == g else node(g), leaf(g+1) if max(i,j) == g+1 else node(g+1))
-    pprint(pl)
+    #pprint(pl)
     mrtree = voxelize_to_point_tuples_tree_by_morton_radix(mpi_sorted_compacted, 0, pl)
 
     # for i in range(1,100):
@@ -277,9 +279,11 @@ def construct_binary_radix_tree(pl):
 
 def main():
     # testpoints = [gen_random_point() for _ in xrange(0, 100)]
-    testset = normalize_points(random.sample(HAND, 4))
+    testset = normalize_points(random.sample(HAND, 10))
+    #testset = normalize_points(HAND)
     # testset = HAND
-    testpoints = [perturbate_point(p, 0.0) for p in random.sample(testset, 4)]
+    testpoints = [perturbate_point(p, 0.0) for p in random.sample(testset, 10)]
+
 
     point_search_results = []
 
@@ -323,7 +327,7 @@ def main():
 
     pprint(morton_tree)
     print("\n")
-    for res in range(0, 4):
+    for res in range(0, 10):
         print(testpoints[res])
         for c in point_search_results:
             print(c[res])
