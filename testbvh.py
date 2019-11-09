@@ -3,8 +3,25 @@ import gzip
 import pickle
 import random
 from math import log2, floor, ceil
-from pprint import pprint
 from timeit import default_timer as timer
+
+import attr
+
+
+@attr.s
+class Node:
+    d = attr.ib(type=int)
+    split = attr.ib(type=float)
+    lc = attr.ib()
+    rc = attr.ib()
+
+    def print_subtree(self, depth):
+        print(" " * depth, self.d, self.split)
+        for n in self.lc, self.rc:
+            if n and isinstance(n, self.__class__):
+                n.print_subtree(depth + 1)
+            else:
+                print(" " * depth, n)
 
 
 def clz(n):
@@ -87,8 +104,11 @@ def voxelize(pointset, criterion=calc_median, depth=-1, max_leaf_size=1):
     testset_sorted = sorted(pointset, key=lambda g: g[d])
     splitting_index = int(criterion(testset_sorted, d))
 
-    return testset_sorted[splitting_index][d], voxelize(testset_sorted[:splitting_index], criterion, depth + 1), \
-           voxelize(testset_sorted[splitting_index:], criterion, depth + 1)
+    return Node(
+        d=d,
+        split=testset_sorted[splitting_index][d],
+        lc=voxelize(testset_sorted[:splitting_index], criterion, depth + 1),
+        rc=voxelize(testset_sorted[splitting_index:], criterion, depth + 1))
 
 
 def dist(p1, p2):
@@ -98,24 +118,24 @@ def dist(p1, p2):
     return dist
 
 
-def find_node_by_point_tree(tree, point, depth=-1):
-    if not tree:
+def find_node_by_point_tree(node, point, depth=-1):
+    if not node:
         return None
-    d = (depth + 1) % len(dims)
     # Leaf found
-    if isinstance(tree[0], tuple):
-        return find_node_by_point_linear(tree, point)
+    if isinstance(node, list):
+        return find_node_by_point_linear(node, point)
         # return tree[0]
 
+    d = node.d
     # print d, tree[0]
     # print(point[d], tree[0])
-    search_left = point[d] < tree[0]
-    best = find_node_by_point_tree(tree[1 if search_left else 2], point, depth + 1)
+    search_left = point[d] < node.split
+    best = find_node_by_point_tree(node.lc if search_left else node.rc, point, depth + 1)
     if best is None:
         return None
     # There is a chance that there is a better fitting point on the other side of the hyperplane
-    if (tree[0] - point[d]) ** 2 < dist(best, point):
-        cand = find_node_by_point_tree(tree[1 if not search_left else 2], point, depth + 1)
+    if (node.split - point[d]) ** 2 < dist(best, point):
+        cand = find_node_by_point_tree(node.lc if search_left else node.rc, point, depth + 1)
         if cand is not None:
             best = cand if dist(cand, point) < dist(best, point) else best
     return best
@@ -137,8 +157,8 @@ def get_morton_code(point):
             assert (point_quadrant[d] >= 0)
             assert (point_quadrant[d] < 2 ** MORTON_BITS_PER_DIM)
 
-            cp = (point_quadrant[d]>>k) & 1
-            cp_shifted = cp << (len(dims) -1 -d+k*len(dims))
+            cp = (point_quadrant[d] >> k) & 1
+            cp_shifted = cp << (len(dims) - 1 - d + k * len(dims))
             point_code = point_code ^ (cp_shifted)
 
     return point_code
@@ -175,7 +195,7 @@ def find_nearest_neighbor_morton(morton_list, point):
 
 def radix_delta(mpisl, i1, i2):
     if 0 <= i1 < len(mpisl) and 0 <= i2 < len(mpisl):
-        return clz(mpisl[i1][1] ^ mpisl[i2][1])
+        return clz(mpisl[i1][1] ^ mpisl[i2][1]) - 1 # CAUTION! 64 is not 63 !!!
     else:
         return -1
 
@@ -186,6 +206,16 @@ def compute_range_upper_bound(mpisl, index, d):
     while radix_delta(mpisl, index, index + l_max * d) > delta_min:
         l_max = l_max * 2
     return l_max
+
+
+def morton2point(mpoint):
+    point = [0, 0, 0]
+    for d in dims:
+        coordinate = 0.0
+        for k in range(0, MORTON_BITS_PER_DIM):
+            coordinate = coordinate + (((mpoint >> (len(dims) - 1 - d + k * len(dims))) & 1) << k)
+        point[d] = coordinate / num_cells
+    return tuple(point)
 
 
 def calculate_node_properties(mpisl, i):
@@ -211,43 +241,43 @@ def calculate_node_properties(mpisl, i):
         if radix_delta(mpisl, i, i + (s + t) * d) > delta_node:
             s = s + t
     gamma = i + s * d + min(d, 0)  # split position
-    #print("GAMMA CALC:", i, s, d, min(d, 0))
+    # print("GAMMA CALC:", i, s, d, min(d, 0))
     split_delta = radix_delta(mpisl, gamma, gamma + 1)
     #print("BLA ", i, j, l_max * d, gamma, gamma + d, split_delta)
     assert (i <= gamma < j or j <= gamma < i)
     return j, gamma, split_delta
 
 
-def morton2point(mpoint):
-    point = [0, 0, 0]
-    for d in dims:
-        coordinate = 0.0
-        for k in range(0, MORTON_BITS_PER_DIM):
-            coordinate = coordinate +(((mpoint >> (len(dims) - 1 - d + k * len(dims))) & 1) << k)
-        point[d] = coordinate / num_cells
-    return tuple(point)
-
-
 def voxelize_to_point_tuples_tree_by_morton_radix(mpisl, i, orig_points):
     j, g, split_delta = calculate_node_properties(mpisl, i)
+    """
+    print ("POINTS around split ")
+    print (mpisl[g-1])
+    print("{0:64b}".format(mpisl[g-1][1]), morton2point(mpisl[g-1][1]))
+    print("{0:64b}".format(mpisl[g][1]), morton2point(mpisl[g][1]))
+    print("{0:64b}".format(mpisl[g+1][1]), morton2point(mpisl[g+1][1]))
+    """
+
 
     if min(i, j) == g:
         left_child = [orig_points[k] for k in mpisl[g][0]]
     else:
-        #print("<<<<<")
+        # print("<<<<<")
         left_child = voxelize_to_point_tuples_tree_by_morton_radix(mpisl, g, orig_points)
 
     if max(i, j) == g + 1:
         right_child = [orig_points[k] for k in mpisl[g + 1][0]]
     else:
-        #print(">>>>>")
+        # print(">>>>>")
         right_child = voxelize_to_point_tuples_tree_by_morton_radix(mpisl, g + 1, orig_points)
 
     assert (split_delta >= 0)  # this should never happen, as we handle leaves on upper layers
     assert (g >= 0)
-    split_position = orig_points[g][len(dims) - 1 - (split_delta % len(dims))]
+    split_dim = split_delta % len(dims)
 
-    return split_position, left_child, right_child
+    split_position = orig_points[mpisl[g+1][0][0]][split_dim] # !!!!!!! +1 !!!!!
+
+    return Node(d=split_dim, split=split_position, lc=left_child, rc=right_child)
 
 
 def compact_duplicates(mpisl):
@@ -269,7 +299,7 @@ def construct_binary_radix_tree(pl):
     # for i in range(0, len(mpi_sorted_compacted) - 1):
     #    j, g = calculate_node_properties(mpi_sorted_compacted, i)
     #    # node = (leaf(i) if min(i,j) == g else node(g), leaf(g+1) if max(i,j) == g+1 else node(g+1))
-    #pprint(pl)
+    # pprint(pl)
     mrtree = voxelize_to_point_tuples_tree_by_morton_radix(mpi_sorted_compacted, 0, pl)
 
     # for i in range(1,100):
@@ -278,12 +308,15 @@ def construct_binary_radix_tree(pl):
 
 
 def main():
+    test_mpisl = [([0.0], 1 << 62), ([0.0], 1 << 0)]
+    print (radix_delta(test_mpisl, 0,1))
+    print("{0:64b}".format(test_mpisl[1][1]))
+    print("{0:64b}".format(test_mpisl[0][1]))
     # testpoints = [gen_random_point() for _ in xrange(0, 100)]
-    testset = normalize_points(random.sample(HAND, 10))
-    #testset = normalize_points(HAND)
+    #testset = normalize_points(random.sample(HAND, 100000))
+    testset = normalize_points(HAND)
     # testset = HAND
-    testpoints = [perturbate_point(p, 0.0) for p in random.sample(testset, 10)]
-
+    testpoints = [perturbate_point(p, 0.0) for p in random.sample(testset, 10000)]
 
     point_search_results = []
 
@@ -294,8 +327,7 @@ def main():
         tree = voxelize(testset, criterion=criterion)
         end = timer()
         print("time to build", (end - start))
-
-        pprint(tree)
+        #tree.print_subtree(0)
 
         start = timer()
         search_results = []
@@ -325,7 +357,7 @@ def main():
     end = timer()
     print("time to find point", (end - start))
 
-    pprint(morton_tree)
+    #morton_tree.print_subtree(0)
     print("\n")
     for res in range(0, 10):
         print(testpoints[res])
