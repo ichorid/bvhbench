@@ -245,7 +245,7 @@ def voxelize_to_point_tuples_tree_by_morton_radix(mpisl, i, orig_points):
 
     assert (split_delta >= 0)  # this should never happen, as we handle leaves on upper layers
     assert (g >= 0)
-    split_position = morton2point(mpisl[g][1])[len(dims) - 1 - (split_delta % len(dims))]
+    split_position = orig_points[g][len(dims) - 1 - (split_delta % len(dims))]
 
     return split_position, left_child, right_child
 
