@@ -195,7 +195,7 @@ def find_nearest_neighbor_morton(morton_list, point):
 
 def radix_delta(mpisl, i1, i2):
     if 0 <= i1 < len(mpisl) and 0 <= i2 < len(mpisl):
-        return clz(mpisl[i1][1] ^ mpisl[i2][1]) - 1 # CAUTION! 64 is not 63 !!!
+        return clz(mpisl[i1][1] ^ mpisl[i2][1]) - 1  # CAUTION! 64 is not 63 !!!
     else:
         return -1
 
@@ -243,9 +243,19 @@ def calculate_node_properties(mpisl, i):
     gamma = i + s * d + min(d, 0)  # split position
     # print("GAMMA CALC:", i, s, d, min(d, 0))
     split_delta = radix_delta(mpisl, gamma, gamma + 1)
-    #print("BLA ", i, j, l_max * d, gamma, gamma + d, split_delta)
+    # print("BLA ", i, j, l_max * d, gamma, gamma + d, split_delta)
     assert (i <= gamma < j or j <= gamma < i)
     return j, gamma, split_delta
+
+
+def gen_flat_tree_morton(mpisl, orig_points):
+    result = []
+    for i in range(0, len(mpisl)):
+        j, g, split_delta = calculate_node_properties(mpisl, i)
+        split_dim = split_delta % len(dims)
+        split_position = orig_points[mpisl[g + 1][0][0]][split_dim]  # !!!!!!! +1 !!!!!
+        result.append(Node(d=split_dim, split=split_position, lc=g, rc=g + 1))
+    return result
 
 
 def voxelize_to_point_tuples_tree_by_morton_radix(mpisl, i, orig_points):
@@ -257,7 +267,6 @@ def voxelize_to_point_tuples_tree_by_morton_radix(mpisl, i, orig_points):
     print("{0:64b}".format(mpisl[g][1]), morton2point(mpisl[g][1]))
     print("{0:64b}".format(mpisl[g+1][1]), morton2point(mpisl[g+1][1]))
     """
-
 
     if min(i, j) == g:
         left_child = [orig_points[k] for k in mpisl[g][0]]
@@ -275,7 +284,7 @@ def voxelize_to_point_tuples_tree_by_morton_radix(mpisl, i, orig_points):
     assert (g >= 0)
     split_dim = split_delta % len(dims)
 
-    split_position = orig_points[mpisl[g+1][0][0]][split_dim] # !!!!!!! +1 !!!!!
+    split_position = orig_points[mpisl[g + 1][0][0]][split_dim]  # !!!!!!! +1 !!!!!
 
     return Node(d=split_dim, split=split_position, lc=left_child, rc=right_child)
 
@@ -300,7 +309,8 @@ def construct_binary_radix_tree(pl):
     #    j, g = calculate_node_properties(mpi_sorted_compacted, i)
     #    # node = (leaf(i) if min(i,j) == g else node(g), leaf(g+1) if max(i,j) == g+1 else node(g+1))
     # pprint(pl)
-    mrtree = voxelize_to_point_tuples_tree_by_morton_radix(mpi_sorted_compacted, 0, pl)
+    #mrtree = voxelize_to_point_tuples_tree_by_morton_radix(mpi_sorted_compacted, 0, pl)
+    return gen_flat_tree_morton(mpi_sorted_compacted, pl)
 
     # for i in range(1,100):
     #    print(radix_delta(mpi_sorted[i-1][1], mpi_sorted[i][1]))
@@ -309,16 +319,21 @@ def construct_binary_radix_tree(pl):
 
 def main():
     test_mpisl = [([0.0], 1 << 62), ([0.0], 1 << 0)]
-    print (radix_delta(test_mpisl, 0,1))
+    print(radix_delta(test_mpisl, 0, 1))
     print("{0:64b}".format(test_mpisl[1][1]))
     print("{0:64b}".format(test_mpisl[0][1]))
     # testpoints = [gen_random_point() for _ in xrange(0, 100)]
-    #testset = normalize_points(random.sample(HAND, 100000))
+    # testset = normalize_points(random.sample(HAND, 100000))
     testset = normalize_points(HAND)
     # testset = HAND
     testpoints = [perturbate_point(p, 0.0) for p in random.sample(testset, 10000)]
 
     point_search_results = []
+
+    a = construct_binary_radix_tree(testset)
+    print (a)
+
+    return
 
     for criterion in (calc_random, calc_SAH, calc_median):
         print(criterion.__name__)
@@ -327,7 +342,7 @@ def main():
         tree = voxelize(testset, criterion=criterion)
         end = timer()
         print("time to build", (end - start))
-        #tree.print_subtree(0)
+        # tree.print_subtree(0)
 
         start = timer()
         search_results = []
@@ -357,7 +372,7 @@ def main():
     end = timer()
     print("time to find point", (end - start))
 
-    #morton_tree.print_subtree(0)
+    # morton_tree.print_subtree(0)
     print("\n")
     for res in range(0, 10):
         print(testpoints[res])
