@@ -8,8 +8,19 @@ from timeit import default_timer as timer
 
 import attr
 
-RULER = "012" * 21
+MORTON_BITS_PER_DIM = 10
+num_cells = 2 ** MORTON_BITS_PER_DIM
 
+RULER = "012" * MORTON_BITS_PER_DIM
+
+# FIXME: this implementation can't handle leafs with points that have exactly the same coordinate.
+
+
+DEBUG = False
+
+def debug_print(*args, **kwargs):
+    if DEBUG:
+        print (*args, **kwargs)
 
 @attr.s
 class Node:
@@ -92,7 +103,7 @@ def calc_SAH(points, d):
 
 
 def calc_median(testset_sorted, d):
-    return len(testset_sorted) / 2
+    return len(testset_sorted) // 2
 
 
 def calc_random(testset_sorted, d):
@@ -106,6 +117,9 @@ def voxelize(pointset, criterion=calc_median, depth=-1, max_leaf_size=1):
 
     testset_sorted = sorted(pointset, key=lambda g: g[d])
     splitting_index = int(criterion(testset_sorted, d))
+    # Dumb hack to fix duplicate coordinates problem.
+    while splitting_index > 0 and testset_sorted[splitting_index][d] == testset_sorted[splitting_index-1][d]:
+        splitting_index = splitting_index - 1
 
     return Node(
         d=d,
@@ -167,10 +181,6 @@ def find_node_by_point_tree_flat(nodes_list, point, index, depth=-1):
         if cand is not None:
             best = cand if dist(cand, point) < dist(best, point) else best
     return best
-
-
-MORTON_BITS_PER_DIM = 21
-num_cells = 2 ** MORTON_BITS_PER_DIM
 
 
 def get_quadrant(point):
@@ -246,11 +256,11 @@ def morton2point(mpoint):
 
 
 def calculate_node_properties(mpisl, i):
-    print("\n<<>>")
-    print("node index ", i)
-    print("left: ", "{0:64b}".format(mpisl[i - 1][1]), radix_delta(mpisl, i, i - 1))
-    print("node: ", "{0:64b}".format(mpisl[i][1]))
-    print("right:", "{0:64b}".format(mpisl[i + 1][1]), radix_delta(mpisl, i, i + 1))
+    debug_print("\n<<>>")
+    debug_print("node index ", i)
+    debug_print("left: ", "{0:64b}".format(mpisl[i - 1][1]), radix_delta(mpisl, i, i - 1))
+    debug_print("node: ", "{0:64b}".format(mpisl[i][1]))
+    debug_print("right:", "{0:64b}".format(mpisl[i + 1][1]), radix_delta(mpisl, i, i + 1))
     # Determine "d".
     # Get deltas with the node to the left and to the right of the given i.
     # If right delta is higher than the left one, return +1, otherwise -1
@@ -260,13 +270,14 @@ def calculate_node_properties(mpisl, i):
     # Compute range end using binary search
     delta_min = radix_delta(mpisl, i, i - d)
     l_max = compute_range_upper_bound(mpisl, i, d)
-    print("l_max", l_max)
-    if d > 0:
-        for ind in range(i, min(i + l_max + 1, len(mpisl))):
-            print("node:", ind, ":{0:64b}".format(mpisl[ind][1]))
-    else:
-        for ind in range(max(0, i - l_max), i + 1):
-            print("node:", ind, ":{0:64b}".format(mpisl[ind][1]))
+    if DEBUG:
+        print("l_max", l_max)
+        if d > 0:
+            for ind in range(i, min(i + l_max + 1, len(mpisl))):
+                print("node:", ind, ":{0:64b}".format(mpisl[ind][1]))
+        else:
+            for ind in range(max(0, i - l_max), i + 1):
+                print("node:", ind, ":{0:64b}".format(mpisl[ind][1]))
 
     l = 0  # the length of the node domain in direction d
     for t in [int(l_max / (2 ** n)) for n in range(1, int(log2(l_max) + 1))]:
@@ -282,7 +293,7 @@ def calculate_node_properties(mpisl, i):
     t_real = l / 2
     while True:
         t = ceil(t_real)
-        print("binary_search_step", i + (s + t) * d)
+        debug_print("binary_search_step", i + (s + t) * d)
         if radix_delta(mpisl, i, i + (s + t) * d) > delta_node:
             s = s + t
         if t == 1:
@@ -290,7 +301,7 @@ def calculate_node_properties(mpisl, i):
         t_real = t_real / 2
 
     gamma = i + s * d + min(d, 0)  # split position
-    print("s g", s, gamma)
+    debug_print("s g", s, gamma)
     # print("GAMMA CALC:", i, s, d, min(d, 0))
     split_delta = radix_delta(mpisl, gamma, gamma + 1)
     assert (split_delta == radix_delta(mpisl, i, j))
@@ -320,20 +331,24 @@ def gen_flat_tree_morton(mpisl, orig_points):
             right_child = g + 1
 
         split_dim = split_delta % len(dims)
-        split_position = orig_points[mpisl[g + 1][0][0]][split_dim]  # !!!!!!! +1 !!!!!
+
+        mask_length = split_delta + 1
+        split_surface_prefix_mask = ((1 << mask_length) - 1) << (63 - mask_length)
+        split_surface_morton_code = morton2point(mpisl[g + 1][1] & split_surface_prefix_mask)
+        split_position = split_surface_morton_code[split_dim]
 
         result.append(Node(d=split_dim, split=split_position, lc=left_child, rc=right_child))
-        print(i, result[-1], g, g + 1)
+        debug_print(i, result[-1], g, g + 1)
     print("SET SIZE", len(check))
     return result
 
 
 def voxelize_to_point_tuples_tree_by_morton_radix(mpisl, i, orig_points):
     j, g, split_delta = calculate_node_properties(mpisl, i)
-    print("POINTS around split ")
-    print("{0:64b}".format(mpisl[g - 1][1]), morton2point(mpisl[g - 1][1]))
-    print("{0:64b}".format(mpisl[g][1]), morton2point(mpisl[g][1]))
-    print("{0:64b}".format(mpisl[g + 1][1]), morton2point(mpisl[g + 1][1]))
+    debug_print("POINTS around split ")
+    debug_print("{0:64b}".format(mpisl[g - 1][1]), morton2point(mpisl[g - 1][1]))
+    debug_print("{0:64b}".format(mpisl[g][1]), morton2point(mpisl[g][1]))
+    debug_print("{0:64b}".format(mpisl[g + 1][1]), morton2point(mpisl[g + 1][1]))
 
     if min(i, j) == g:
         left_child = [orig_points[k] for k in mpisl[g][0]]
@@ -357,47 +372,47 @@ def voxelize_to_point_tuples_tree_by_morton_radix(mpisl, i, orig_points):
 
     d = 1 if j > i else -1
     mask_length = split_delta + 1
-    split_surface_prefix_mask = ((1 << mask_length) - 1) << (63-mask_length)
+    split_surface_prefix_mask = ((1 << mask_length) - 1) << (63 - mask_length)
     split_surface_morton_code = morton2point(mpisl[g + 1][1] & split_surface_prefix_mask)
-    split_position=split_surface_morton_code[split_dim]
+    split_position = split_surface_morton_code[split_dim]
 
-    # Check that the points in the i,j range really belong to spatial constraints
+    if DEBUG:
+        # Check that the points in the i,j range really belong to spatial constraints
+        if j > i:
+            left_range, right_range = [z for z in range(i, g + 1)], [z for z in range(g + 1, j + 1)]
+        else:
+            left_range, right_range = [z for z in range(j, g + 1)], [z for z in range(g + 1, i + 1)]
 
-    if j > i:
-        left_range, right_range = [z for z in range(i, g + 1)], [z for z in range(g + 1, j + 1)]
-    else:
-        left_range, right_range = [z for z in range(j, g + 1)], [z for z in range(g + 1, i + 1)]
+        # left_subnodes = [orig_points[mpisl[ind][0][0]] for ind in left_range]
+        # right_subnodes = [orig_points[mpisl[ind][0][0]] for ind in right_range]
+        left_subnodes = [morton2point(mpisl[ind][1]) for ind in left_range]
+        right_subnodes = [morton2point(mpisl[ind][1]) for ind in right_range]
+        print("\n")
+        print("INDEX: ", i, j, g, split_delta, d)
+        print("node l: ", len(left_range), left_range)
+        print("node r: ", len(right_range), right_range)
 
-    # left_subnodes = [orig_points[mpisl[ind][0][0]] for ind in left_range]
-    # right_subnodes = [orig_points[mpisl[ind][0][0]] for ind in right_range]
-    left_subnodes = [morton2point(mpisl[ind][1]) for ind in left_range]
-    right_subnodes = [morton2point(mpisl[ind][1]) for ind in right_range]
-    print("\n")
-    print("INDEX: ", i, j, g, split_delta, d)
-    print("node l: ", len(left_range), left_range)
-    print("node r: ", len(right_range), right_range)
+        print("Left subnodes ")
+        for z in left_subnodes:
+            print(z)
+            print("{0:63b}".format(get_morton_code(z)))
+            print(RULER)
+        print("Split:", split_dim, split_position)
+        print("Right subnodes")
+        for z in right_subnodes:
+            print("{0:63b}".format(get_morton_code(z)))
+            print(RULER)
+            print(z)
 
-    print("Left subnodes ")
-    for z in left_subnodes:
-        print(z)
-        print("{0:63b}".format(get_morton_code(z)))
-        print(RULER)
-    print("Split:", split_dim, split_position)
-    print("Right subnodes")
-    for z in right_subnodes:
-        print("{0:63b}".format(get_morton_code(z)))
-        print(RULER)
-        print(z)
-
-    for z in left_subnodes:
-        if not z[split_dim] < split_position:
-            print(" ERROR ")
-            exit(1)
-    for z in right_subnodes:
-        # assert(z[split_dim] >= split_position)
-        if not z[split_dim] >= split_position:
-            print(" ERROR ")
-            exit(1)
+        for z in left_subnodes:
+            if not z[split_dim] < split_position:
+                print(" ERROR ")
+                exit(1)
+        for z in right_subnodes:
+            # assert(z[split_dim] >= split_position)
+            if not z[split_dim] >= split_position:
+                print(" ERROR ")
+                exit(1)
 
     return Node(d=split_dim, split=split_position, lc=left_child, rc=right_child)
 
@@ -426,7 +441,7 @@ def construct_binary_radix_tree(pl):
     # pprint(pl)
 
     mrtree = voxelize_to_point_tuples_tree_by_morton_radix(mpi_sorted_compacted, 0, pl)
-    mrtree.print_subtree(0)
+    #mrtree.print_subtree(0)
     flat = gen_flat_tree_morton(mpi_sorted_compacted, pl)
     print("CHECK_FLAT")
     check_flat_tree(flat)
@@ -446,8 +461,7 @@ def check_constraints(point, constraints):
         if coord_r is not None:
             right_ok = p < coord_r
         if not left_ok or not right_ok:
-            print("ERROR", point, constraints, (coord_l, coord_r))
-            exit(1)
+            print("ERROR", point, constraints, (d, coord_l, coord_r))
             return True
     return False
 
@@ -456,11 +470,20 @@ def check_flat_tree(nodes_list: list):
     for node in nodes_list:
         constraints = [[None, None], [None, None], [None, None]]
         for child, left in ((node.lc, 1), (node.rc, 0)):  # left node constrained from right, and vice-versa
+            old_dim_constraint = constraints[node.d][left]
+            if old_dim_constraint is not None:
+                if left:
+                    assert (node.split < old_dim_constraint)
+                else:
+                    assert (node.split >= old_dim_constraint)
+
             new_constraints = deepcopy(constraints)
             new_constraints[node.d][left] = node.split
             if isinstance(child, list):
                 for point in child:
-                    check_constraints(point, new_constraints)
+                    if check_constraints(point, new_constraints):
+                        print(node)
+                        exit(1)
 
 
 def check_binary_tree(node, constraints: list = None):
@@ -471,15 +494,17 @@ def check_binary_tree(node, constraints: list = None):
             check_constraints(point, constraints)
         return
 
-    for child, left in ((node.lc, 1), (node.rc, 0)):  # left node constrained from right, and vice-versa
+    for child, left in ((node.lc, 1), (node.rc, 0)):  # left node constrained from the right, and vice-versa
+        old_dim_constraint = constraints[node.d][left]
+        if old_dim_constraint is not None:
+            if left:
+                assert (node.split < old_dim_constraint)
+            else:
+                assert (node.split >= old_dim_constraint)
+
         new_constraints = deepcopy(constraints)
         new_constraints[node.d][left] = node.split
         check_binary_tree(child, new_constraints)
-
-
-def check_flat_morton_tree(nodes_list: list):
-    for i, node in nodes_list:
-        node.rc
 
 
 def main():
@@ -495,7 +520,9 @@ def main():
     # pprint(get_morton_code((0,0,0)))
     # print("{0:64b}".format(get_morton_code((00.0000006*6.1,00.0000006*6.7,0.0000006))))
     # testpoints = [gen_random_point() for _ in xrange(0, 100)]
-    testset = normalize_points(random.sample(HAND, 100))
+    # WARNING: we perturbate the points to guarantee that there will be no duplicates
+    testset = normalize_points(random.sample(HAND, 10000))
+    #testset = normalize_points([perturbate_point(p, 0.000001) for p in random.sample(HAND, 10000)])
     # testset = normalize_points(HAND)
     # testset = HAND
     testpoints = [perturbate_point(p, 0.0) for p in random.sample(testset, 5)]
@@ -503,6 +530,7 @@ def main():
     point_search_results = []
 
     for criterion in (calc_random, calc_SAH, calc_median):
+        break
         print(criterion.__name__)
         # SAH
         start = timer()
