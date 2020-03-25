@@ -430,27 +430,34 @@ def compact_duplicates(mpisl):
     return new_list
 
 
-def construct_binary_radix_tree(pl):
+def convert_points_to_morton_codes(pl):
     mortonized_points = tuple(get_morton_code(p) for p in pl)
     mortonized_points_indexed = enumerate(mortonized_points)
     mpi_sorted = sorted(mortonized_points_indexed, key=lambda x: x[1])
     mpi_sorted_compacted = compact_duplicates(mpi_sorted)
+    return mpi_sorted_compacted
+
+
+def construct_binary_tree_by_morton_codes(pl):
+    morton_points = convert_points_to_morton_codes(pl)
+    mrtree = voxelize_to_point_tuples_tree_by_morton_radix(morton_points, 0, pl)
     # for i in range(0, len(mpi_sorted_compacted) - 1):
     #    j, g = calculate_node_properties(mpi_sorted_compacted, i)
     #    # node = (leaf(i) if min(i,j) == g else node(g), leaf(g+1) if max(i,j) == g+1 else node(g+1))
     # pprint(pl)
+    check_binary_tree(mrtree)
 
-    mrtree = voxelize_to_point_tuples_tree_by_morton_radix(mpi_sorted_compacted, 0, pl)
-    #mrtree.print_subtree(0)
-    flat = gen_flat_tree_morton(mpi_sorted_compacted, pl)
-    print("CHECK_FLAT")
-    check_flat_tree(flat)
-    print("FINISH CHECK_FLAT")
 
     # for i in range(1,100):
     #    print(radix_delta(mpi_sorted[i-1][1], mpi_sorted[i][1]))
     return mrtree
 
+
+def construct_flat_tree(pl):
+    morton_points = convert_points_to_morton_codes(pl)
+    flat = gen_flat_tree_morton(morton_points, pl)
+    check_flat_tree(flat)
+    return flat
 
 def check_constraints(point, constraints):
     for d, (coord_l, coord_r) in enumerate(constraints):
@@ -522,10 +529,11 @@ def main():
     # testpoints = [gen_random_point() for _ in xrange(0, 100)]
     # WARNING: we perturbate the points to guarantee that there will be no duplicates
     testset = normalize_points(random.sample(HAND, 10000))
+    testset = normalize_points(HAND)
     #testset = normalize_points([perturbate_point(p, 0.000001) for p in random.sample(HAND, 10000)])
     # testset = normalize_points(HAND)
     # testset = HAND
-    testpoints = [perturbate_point(p, 0.0) for p in random.sample(testset, 5)]
+    testpoints = [perturbate_point(p, 0.0) for p in random.sample(testset, 100)]
 
     point_search_results = []
 
@@ -542,7 +550,7 @@ def main():
         check_binary_tree(tree)
         start = timer()
         search_results = []
-        for test_point in testpoints[:10]:
+        for test_point in testpoints:
             search_results.append(find_node_by_point_tree(tree, test_point))
         point_search_results.append(search_results)
 
@@ -551,29 +559,33 @@ def main():
         print("time to find point", (end - start))
         print("\n")
 
-    print("morton stuff")
+    print("construct morton-based binary tree")
     start = timer()
-    # morton_tree = construct_binary_radix_tree(random.sample(testset, 10))
-    morton_tree = construct_binary_radix_tree(testset)
+    morton_tree = construct_binary_tree_by_morton_codes(testset)
     end = timer()
     print("time to build ", (end - start))
 
-    check_binary_tree(morton_tree)
+    print("construct morton-based flat tree")
+    start = timer()
+    flat_tree = construct_flat_tree(testset)
+    end = timer()
+    print("time to build ", (end - start))
+
     # mortonized_points_sorted = sorted(mortonized_points)
     # m_point = mortonized_points_sorted[find_nearest_neighbor_morton(mortonized_points_sorted, testpoints[10])]
     # print(mortonized_points.index(m_point))
     start = timer()
     morton_results = []
-    for test_point in testpoints[:10]:
-        # morton_results.append(find_node_by_point_tree_flat(morton_tree, test_point, 0))
-        morton_results.append(find_node_by_point_tree(morton_tree, test_point))
+    for test_point in testpoints[:100]:
+        morton_results.append(find_node_by_point_tree_flat(flat_tree, test_point, 0))
+        #morton_results.append(find_node_by_point_tree(morton_tree, test_point))
     point_search_results.append(morton_results)
     end = timer()
     print("time to find point", (end - start))
 
     # morton_tree.print_subtree(0)
     print("\n")
-    for res in range(0, 5):
+    for res in range(0, 10):
         print(testpoints[res])
         for c in point_search_results:
             print(c[res])
