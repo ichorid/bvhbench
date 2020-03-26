@@ -3,24 +3,55 @@ import gzip
 import pickle
 import random
 from copy import deepcopy
+from itertools import permutations
 from math import log2, floor, ceil
+from pprint import pprint
 from timeit import default_timer as timer
 
 import attr
+from numpy.ma import empty
+
+set_size = 100000
+
+dims = (0, 1, 2)
+
+random.seed(123)
 
 MORTON_BITS_PER_DIM = 10
 num_cells = 2 ** MORTON_BITS_PER_DIM
+HIGHEST_MORTON_POINT = 2 ** (MORTON_BITS_PER_DIM * len(dims)) - 1
 
 RULER = "012" * MORTON_BITS_PER_DIM
 
 # FIXME: this implementation can't handle leafs with points that have exactly the same coordinate.
 
+dim_mask = (int("001" * MORTON_BITS_PER_DIM, 2),
+            int("010" * MORTON_BITS_PER_DIM, 2),
+            int("100" * MORTON_BITS_PER_DIM, 2))
 
 DEBUG = False
 
+TREELET_SIZE = 7
+K_BIT_PERMUTATIONS = list(range(0, TREELET_SIZE + 1))
+K_BIT_PERMUTATIONS[0] = []
+for num_ones in range(1, TREELET_SIZE + 1):
+    K_BIT_PERMUTATIONS[num_ones] = [int("".join(str(nums) for nums in tp), 2) for tp in
+                                    {k for k in permutations("1" * num_ones + "0" * (TREELET_SIZE - num_ones))}]
+    print(K_BIT_PERMUTATIONS[num_ones])
+
+zz = set()
+for z in K_BIT_PERMUTATIONS:
+    for zzz in z:
+        zz.add(zzz)
+
+
+print (len(zz))
+
+
 def debug_print(*args, **kwargs):
     if DEBUG:
-        print (*args, **kwargs)
+        print(*args, **kwargs)
+
 
 @attr.s
 class Node:
@@ -44,12 +75,6 @@ def clz(n):
 
 with gzip.open("hand_small.pickle.gz", 'rb') as f:
     HAND = pickle.load(f)
-
-set_size = 100000
-
-dims = (0, 1, 2)
-
-random.seed(123)
 
 
 def gen_random_point(a=-1.0, b=1.0):
@@ -118,7 +143,7 @@ def voxelize(pointset, criterion=calc_median, depth=-1, max_leaf_size=1):
     testset_sorted = sorted(pointset, key=lambda g: g[d])
     splitting_index = int(criterion(testset_sorted, d))
     # Dumb hack to fix duplicate coordinates problem.
-    while splitting_index > 0 and testset_sorted[splitting_index][d] == testset_sorted[splitting_index-1][d]:
+    while splitting_index > 0 and testset_sorted[splitting_index][d] == testset_sorted[splitting_index - 1][d]:
         splitting_index = splitting_index - 1
 
     return Node(
@@ -447,7 +472,6 @@ def construct_binary_tree_by_morton_codes(pl):
     # pprint(pl)
     check_binary_tree(mrtree)
 
-
     # for i in range(1,100):
     #    print(radix_delta(mpi_sorted[i-1][1], mpi_sorted[i][1]))
     return mrtree
@@ -458,6 +482,7 @@ def construct_flat_tree(pl):
     flat = gen_flat_tree_morton(morton_points, pl)
     check_flat_tree(flat)
     return flat
+
 
 def check_constraints(point, constraints):
     for d, (coord_l, coord_r) in enumerate(constraints):
@@ -514,6 +539,52 @@ def check_binary_tree(node, constraints: list = None):
         check_binary_tree(child, new_constraints)
 
 
+def surface_area_morton(point_a, point_b):
+    box_dims = tuple(abs((point_a & dim_mask[d]) - (point_b & dim_mask[d])) for d in dims)
+    surface_area = box_dims[0] * box_dims[1] + box_dims[0] * box_dims[2] + box_dims[1] * box_dims[2]
+    return surface_area
+
+
+def get_bits_from_bitmask(bm):
+    return [int(x) for x in '{:032b}'.format(bm)]
+
+
+def area_union_of_AABBs(L, s):
+    # We use Morton codes to calculate the surface area.
+    lowest, highest = HIGHEST_MORTON_POINT, 0
+    for i in get_bits_from_bitmask(s):
+        point = L[i]
+        if point < lowest:
+            lowest = point
+        if point > highest:
+            highest = point
+    area = surface_area_morton(lowest, highest)
+    return area
+
+
+def SAH_Cost(leaf):
+    raise NotImplementedError()
+
+
+def optimize_treelet(treelet):
+    L = treelet
+    n = len(L)
+    # Calculate surface area for each subset
+    a = empty(2 ** n, type=float)
+    for s in range(1, 2 ** n):
+        a[s] = area_union_of_AABBs(L, s)
+
+    # Initialize costs of individual leaves
+    c_opt = empty(2 ** n, type=float)
+    for i in range(0, n):
+        c_opt[2 ** i] = SAH_Cost(L[i])
+
+    # Optimize every subset of leaves
+    for k in range(2, n + 1):
+        for s in range(1, 2 ** n):
+            pass
+
+
 def main():
     test_mpisl = [([0.0], 1 << 62), ([0.0], 1 << 0)]
     print(radix_delta(test_mpisl, 0, 1))
@@ -528,9 +599,9 @@ def main():
     # print("{0:64b}".format(get_morton_code((00.0000006*6.1,00.0000006*6.7,0.0000006))))
     # testpoints = [gen_random_point() for _ in xrange(0, 100)]
     # WARNING: we perturbate the points to guarantee that there will be no duplicates
-    testset = normalize_points(random.sample(HAND, 10000))
-    testset = normalize_points(HAND)
-    #testset = normalize_points([perturbate_point(p, 0.000001) for p in random.sample(HAND, 10000)])
+    testset = normalize_points(random.sample(HAND, 100))
+    # testset = normalize_points(HAND)
+    # testset = normalize_points([perturbate_point(p, 0.000001) for p in random.sample(HAND, 10000)])
     # testset = normalize_points(HAND)
     # testset = HAND
     testpoints = [perturbate_point(p, 0.0) for p in random.sample(testset, 100)]
@@ -571,6 +642,8 @@ def main():
     end = timer()
     print("time to build ", (end - start))
 
+    return
+
     # mortonized_points_sorted = sorted(mortonized_points)
     # m_point = mortonized_points_sorted[find_nearest_neighbor_morton(mortonized_points_sorted, testpoints[10])]
     # print(mortonized_points.index(m_point))
@@ -578,7 +651,7 @@ def main():
     morton_results = []
     for test_point in testpoints[:100]:
         morton_results.append(find_node_by_point_tree_flat(flat_tree, test_point, 0))
-        #morton_results.append(find_node_by_point_tree(morton_tree, test_point))
+        # morton_results.append(find_node_by_point_tree(morton_tree, test_point))
     point_search_results.append(morton_results)
     end = timer()
     print("time to find point", (end - start))
