@@ -4,12 +4,12 @@ import pickle
 import random
 from copy import deepcopy
 from itertools import permutations
-from math import log2, floor, ceil
+from math import log2, floor, ceil, inf
 from pprint import pprint
 from timeit import default_timer as timer
 
 import attr
-from numpy.ma import empty
+from numpy import empty
 
 set_size = 100000
 
@@ -44,8 +44,9 @@ for z in K_BIT_PERMUTATIONS:
     for zzz in z:
         zz.add(zzz)
 
+print(len(zz))
 
-print (len(zz))
+TERMINAL_MASKS = tuple(1 << n for n in range(0, TREELET_SIZE))
 
 
 def debug_print(*args, **kwargs):
@@ -55,10 +56,15 @@ def debug_print(*args, **kwargs):
 
 @attr.s
 class Node:
+    index = attr.ib(type=int)
     d = attr.ib(type=int)
     split = attr.ib(type=float)
     lc = attr.ib()
     rc = attr.ib()
+    num_points = attr.ib(type=int, default=0)
+    aabb_surface = attr.ib(type=float, default=0.0)
+    sah_cost = attr.ib(type=float, default=0.0)
+    aabb = attr.ib(type=tuple, default=((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)))
 
     def print_subtree(self, depth):
         print(" " * depth, self.d, self.split)
@@ -336,25 +342,24 @@ def calculate_node_properties(mpisl, i):
 
 
 def gen_flat_tree_morton(mpisl, orig_points):
-    result = []
-    check = set()
+    tree = []
+    leaf_SAH_costs = [0.0 for _ in range(0, len(mpisl))]
     for i in range(0, len(mpisl) - 1):
         j, g, split_delta = calculate_node_properties(mpisl, i)
 
+        # Left child
         if min(i, j) == g:
             left_child = [orig_points[k] for k in mpisl[g][0]]
-            for k in left_child:
-                check.add(k)
         else:
             left_child = g
 
+        # Right child
         if max(i, j) == g + 1:
             right_child = [orig_points[k] for k in mpisl[g + 1][0]]
-            for k in right_child:
-                check.add(k)
         else:
             right_child = g + 1
 
+        # Splitting plane position
         split_dim = split_delta % len(dims)
 
         mask_length = split_delta + 1
@@ -362,10 +367,34 @@ def gen_flat_tree_morton(mpisl, orig_points):
         split_surface_morton_code = morton2point(mpisl[g + 1][1] & split_surface_prefix_mask)
         split_position = split_surface_morton_code[split_dim]
 
-        result.append(Node(d=split_dim, split=split_position, lc=left_child, rc=right_child))
-        debug_print(i, result[-1], g, g + 1)
-    print("SET SIZE", len(check))
-    return result
+        node_surface_area = surface_area(morton2point(mpisl[i][1]), morton2point(mpisl[j][1]))
+        SAH_cost_node = node_surface_area * abs(i - j)
+        split_length = abs(morton2point(mpisl[i][1])[split_dim] - morton2point(mpisl[j][1])[split_dim])
+
+        if isinstance(left_child, list):
+            leaf_SAH_costs[g] = len(left_child) * abs(left_child[0][split_dim] - split_position) / split_length
+
+        if isinstance(right_child, list):
+            leaf_SAH_costs[g + 1] = len(right_child) * abs(right_child[0][split_dim] - split_position) / split_length
+
+        left_border = morton2point(mpisl[i][1])
+        right_border = morton2point(mpisl[j][1])
+        bounding_box = (left_border, right_border) if i > j else (right_border, left_border)
+
+        tree.append(
+            Node(
+                index=i,
+                d=split_dim,
+                split=split_position,
+                lc=left_child,
+                rc=right_child,
+                aabb=bounding_box,
+                num_points=abs(i - j),
+                aabb_surface=node_surface_area,
+                # TODO: replace SAH approximation with proper SAH
+                sah_cost=SAH_cost_node))
+        debug_print(i, tree[-1], g, g + 1)
+    return tree, leaf_SAH_costs
 
 
 def voxelize_to_point_tuples_tree_by_morton_radix(mpisl, i, orig_points):
@@ -477,11 +506,50 @@ def construct_binary_tree_by_morton_codes(pl):
     return mrtree
 
 
+def get_treelet_by_top_parent_index(flat_tree, index):
+    result = []
+    internal_nodes_stack = [flat_tree[index]]
+
+    while len(result) < TREELET_SIZE and internal_nodes_stack:
+        node = internal_nodes_stack[-1]
+        left_is_leaf, right_is_leaf = isinstance(node.lc, list), isinstance(node.rc, list)
+        lc = node.lc if left_is_leaf else flat_tree[node.lc]
+        rc = node.rc if right_is_leaf else flat_tree[node.rc]
+        if left_is_leaf and right_is_leaf:
+            internal_nodes_stack.pop()
+            if len(result) == TREELET_SIZE - 1:  # special case - add internal node as a leaf
+                result.append(node)
+            else:
+                result.extend([lc, rc])
+        else:
+            if left_is_leaf:
+                result.append(lc)
+                internal_nodes_stack.append(rc)
+            elif right_is_leaf:
+                result.append(rc)
+                internal_nodes_stack.append(lc)
+            elif lc.aabb_surface > rc.aabb_surface:
+                internal_nodes_stack.append(lc)
+                result.append(rc)
+            else:
+                internal_nodes_stack.append(rc)
+                result.append(lc)
+
+    return result
+
+
 def construct_flat_tree(pl):
     morton_points = convert_points_to_morton_codes(pl)
-    flat = gen_flat_tree_morton(morton_points, pl)
-    check_flat_tree(flat)
-    return flat
+    flat_tree, leaf_SAH_costs = gen_flat_tree_morton(morton_points, pl)
+    check_flat_tree(flat_tree)
+
+    treelet = get_treelet_by_top_parent_index(flat_tree, index=0)
+    pprint(treelet)
+
+    c_opt, p_opt = optimize_treelet(treelet, leaf_SAH_costs=leaf_SAH_costs)
+    print(c_opt, p_opt)
+
+    return flat_tree
 
 
 def check_constraints(point, constraints):
@@ -539,10 +607,11 @@ def check_binary_tree(node, constraints: list = None):
         check_binary_tree(child, new_constraints)
 
 
-def surface_area_morton(point_a, point_b):
-    box_dims = tuple(abs((point_a & dim_mask[d]) - (point_b & dim_mask[d])) for d in dims)
-    surface_area = box_dims[0] * box_dims[1] + box_dims[0] * box_dims[2] + box_dims[1] * box_dims[2]
-    return surface_area
+def surface_area(point_a, point_b):
+    box_dims = [0.0, 0.0, 0.0]
+    for d in dims:
+        box_dims[d] = abs(point_a[d] - point_b[d])
+    return box_dims[0] * box_dims[1] + box_dims[0] * box_dims[2] + box_dims[1] * box_dims[2]
 
 
 def get_bits_from_bitmask(bm):
@@ -550,39 +619,92 @@ def get_bits_from_bitmask(bm):
 
 
 def area_union_of_AABBs(L, s):
-    # We use Morton codes to calculate the surface area.
-    lowest, highest = HIGHEST_MORTON_POINT, 0
+    corner_a, corner_b = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
     for i in get_bits_from_bitmask(s):
-        point = L[i]
-        if point < lowest:
-            lowest = point
-        if point > highest:
-            highest = point
-    area = surface_area_morton(lowest, highest)
-    return area
+        node = L[i]
+        points_list = node.aabb if isinstance(node, Node) else node
+        for point in points_list:
+            for d in dims:
+                coord = point[d]
+                if coord < corner_a[d]:
+                    corner_a[d] = coord
+                if coord > corner_b[d]:
+                    corner_b[d] = coord
+    return surface_area(corner_a, corner_b)
 
 
-def SAH_Cost(leaf):
-    raise NotImplementedError()
+def get_sah_cost(leaf_SAH_costs, leaf):
+    if isinstance(leaf, list):
+        return 0.0  # Single-point leaves cost nothing
+    return leaf_SAH_costs[leaf.index]
 
 
-def optimize_treelet(treelet):
+def optimize_treelet(treelet, leaf_SAH_costs):
     L = treelet
     n = len(L)
+    assert (n == 7)
+    p_opt = {}
     # Calculate surface area for each subset
-    a = empty(2 ** n, type=float)
+    a = empty(2 ** n, dtype=float)
     for s in range(1, 2 ** n):
         a[s] = area_union_of_AABBs(L, s)
 
     # Initialize costs of individual leaves
-    c_opt = empty(2 ** n, type=float)
+    c_opt = empty(2 ** n, dtype=float)
     for i in range(0, n):
-        c_opt[2 ** i] = SAH_Cost(L[i])
+        c_opt[2 ** i] = get_sah_cost(leaf_SAH_costs, L[i])
 
     # Optimize every subset of leaves
     for k in range(2, n + 1):
-        for s in range(1, 2 ** n):
-            pass
+        for s in K_BIT_PERMUTATIONS[k]:
+            # Try each way of partitioning the leaves
+            best_partit = (inf, 0)
+            delta = (s - 1) & s
+            p = (-delta) & s
+            assert (p != 0)
+            while p != 0:
+                c = c_opt[p] + c_opt[s ^ p]
+                if c < best_partit[0]:
+                    best_partit = (c, p)
+                p = (p - delta) & s
+            # Calculate final SAH cost
+            # TODO: implement collapsing the treelet into a single leaf
+            c_opt[s] = a[s]
+            if p_opt.get(s) is not None:
+                raise
+            p_opt[s] = best_partit
+        print("len", len(p_opt))
+
+    return c_opt[2 ** n - 1], p_opt[2 ** n - 1]
+
+
+"""
+def backtrack_optimized_treelet(p_opt, n):
+    flat_treelet = []
+    s = 2**n-1
+
+
+    while True:
+        p = p_opt[s][1]
+        right_mask = p
+        left_mask = s ^ p
+
+        if p not in TERMINAL_MASKS:
+            Node(
+                lc=left_child,
+                rc=right_child,
+
+                d=split_dim,
+                split=split_position,
+                aabb=bounding_box,
+                num_points=abs(i - j),
+                # TODO: replace SAH approximation with proper SAH
+                sah_cost=SAH_cost_node))
+
+            )
+
+    s = right_mask
+    """
 
 
 def main():
@@ -630,11 +752,11 @@ def main():
         print("time to find point", (end - start))
         print("\n")
 
-    print("construct morton-based binary tree")
-    start = timer()
-    morton_tree = construct_binary_tree_by_morton_codes(testset)
-    end = timer()
-    print("time to build ", (end - start))
+    # print("construct morton-based binary tree")
+    # start = timer()
+    # morton_tree = construct_binary_tree_by_morton_codes(testset)
+    # end = timer()
+    # print("time to build ", (end - start))
 
     print("construct morton-based flat tree")
     start = timer()
