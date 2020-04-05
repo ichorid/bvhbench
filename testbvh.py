@@ -3,6 +3,7 @@ import gzip
 import pickle
 import random
 from copy import deepcopy, copy
+from heapq import heappop, heappush
 from itertools import permutations
 from math import log2, floor, ceil, inf
 from pprint import pprint
@@ -86,7 +87,7 @@ class Leaf:
 
 def make_leaf_from_points(points: list):
     aabb = AABB_from_points(points)
-    aabb_surface = surface_area(*aabb)
+    aabb_surface = 0.0000001 + surface_area(*aabb)
     return Leaf(
         num_points=len(points),
         aabb=aabb,
@@ -392,8 +393,7 @@ def gen_flat_tree_morton(mpisl, orig_points):
         split_position = split_surface_morton_code[split_dim]
 
         node_surface_area = surface_area(morton2point(mpisl[i][1]), morton2point(mpisl[j][1]))
-        SAH_cost_node = node_surface_area * abs(i - j)
-        split_length = abs(morton2point(mpisl[i][1])[split_dim] - morton2point(mpisl[j][1])[split_dim])
+        # split_length = abs(morton2point(mpisl[i][1])[split_dim] - morton2point(mpisl[j][1])[split_dim])
 
         # if isinstance(left_child, list):
         # leaf_SAH_costs[g] = len(left_child) * abs(left_child[0][split_dim] - split_position) / split_length
@@ -403,11 +403,19 @@ def gen_flat_tree_morton(mpisl, orig_points):
 
         left_border = morton2point(mpisl[i][1])
         right_border = morton2point(mpisl[j][1])
-        #bounding_box = (left_border, right_border) if j > i else (right_border, left_border)
+        # bounding_box = (left_border, right_border) if j > i else (right_border, left_border)
         bounding_box = AABB_from_points([left_border, right_border])
 
+        lc_num_points = abs(min(i, j) - g) + 1
+        rc_num_points = abs(max(i, j) - g) + 1
+        split_length = bounding_box[0][split_dim] - bounding_box[1][split_dim]
+        lc_part = split_position - bounding_box[0][split_dim]
+        rc_part = split_length - lc_part
+        SAH_left = node_surface_area * lc_num_points * lc_part / split_length
+        SAH_right = node_surface_area * rc_num_points * rc_part / split_length
+
         for d in dims:
-            assert(bounding_box[0][d] <= bounding_box[1][d])
+            assert (bounding_box[0][d] <= bounding_box[1][d])
 
         tree.append(
             Node(
@@ -417,10 +425,10 @@ def gen_flat_tree_morton(mpisl, orig_points):
                 lc=left_child,
                 rc=right_child,
                 aabb=bounding_box,
-                num_points=abs(i - j),
+                num_points=abs(i - j) + 1,
                 aabb_surface=node_surface_area,
-                # TODO: replace SAH approximation with proper SAH
-                sah_cost=SAH_cost_node))
+                sah_cost=SAH_left + SAH_right
+            ))
         debug_print(i, tree[-1], g, g + 1)
     return tree
 
@@ -536,41 +544,51 @@ def construct_binary_tree_by_morton_codes(pl):
 
 def get_treelet_by_top_parent_index(flat_tree, index):
     treelet_leaves = []
-    internal_nodes_stack = [flat_tree[index]]
+    treelet_nodes = [(1 / flat_tree[index].sah_cost, flat_tree[index])]
+
     internal_nodes_indexes = []
 
-    while len(treelet_leaves) < TREELET_SIZE and internal_nodes_stack:
-        node = internal_nodes_stack[-1]
+    while (len(treelet_leaves) + len(treelet_nodes)) < TREELET_SIZE and treelet_nodes:
+        node = heappop(treelet_nodes)[1]
         internal_nodes_indexes.append(node.index)
         left_is_leaf, right_is_leaf = isinstance(node.lc, Leaf), isinstance(node.rc, Leaf)
         lc = node.lc if left_is_leaf else flat_tree[node.lc]
         rc = node.rc if right_is_leaf else flat_tree[node.rc]
         if left_is_leaf and right_is_leaf:
-            internal_nodes_stack.pop()
-            if len(treelet_leaves) == TREELET_SIZE - 1:  # special case - add internal node as a leaf
-                treelet_leaves.append(node)
-            else:
-                treelet_leaves.extend([lc, rc])
+            treelet_leaves.extend([lc, rc])
         else:
             if left_is_leaf:
                 treelet_leaves.append(lc)
-                internal_nodes_stack.append(rc)
+                heappush(treelet_nodes, (1 / rc.sah_cost, rc))
             elif right_is_leaf:
                 treelet_leaves.append(rc)
-                internal_nodes_stack.append(lc)
-            elif lc.aabb_surface > rc.aabb_surface:
-                internal_nodes_stack.append(lc)
-                treelet_leaves.append(rc)
+                heappush(treelet_nodes, (1 / lc.sah_cost, lc))
             else:
-                internal_nodes_stack.append(rc)
-                treelet_leaves.append(lc)
+                heappush(treelet_nodes, (1 / lc.sah_cost, lc))
+                heappush(treelet_nodes, (1 / rc.sah_cost, rc))
 
-    return treelet_leaves, internal_nodes_indexes
+    result_list = [*treelet_leaves, *[n[1] for n in treelet_nodes]]
+    assert (len(set(id(t) for t in result_list)) == len(result_list))
+    for i in internal_nodes_indexes:
+        assert(i not in [n[1].index for n in treelet_nodes])
+    return result_list, internal_nodes_indexes
+
+
+def update_SAH_costs(flat_tree, index=0):
+    node = flat_tree[index]
+    sah_node = 1.2 * node.aabb_surface
+    for child in node.lc, node.rc:
+        sah_child = child.aabb_surface * child.num_points if isinstance(child, Leaf) else update_SAH_costs(flat_tree,
+                                                                                                           index=child)
+        sah_node += sah_child
+    node.sah_cost = sah_node
+    return sah_node
 
 
 def construct_flat_tree(pl):
     morton_points = convert_points_to_morton_codes(pl)
     flat_tree = gen_flat_tree_morton(morton_points, pl)
+    update_SAH_costs(flat_tree)
     check_flat_tree(flat_tree)
 
     for n in flat_tree:
@@ -578,16 +596,19 @@ def construct_flat_tree(pl):
         rc = n.rc if isinstance(n.rc, Leaf) else flat_tree[n.rc]
         internal_node_from_nodes(lc, rc)
 
-    treelet_leaves, internal_nodes_indexes = get_treelet_by_top_parent_index(flat_tree, index=0)
-    pprint(treelet_leaves)
+    for i in range(0, len(flat_tree)):
+        treelet_leaves, internal_nodes_indexes = get_treelet_by_top_parent_index(flat_tree, index=i)
+        if len(treelet_leaves) < TREELET_SIZE:
+            continue
+        print(i)
 
-    for n in internal_nodes_indexes:
-        print(flat_tree[n])
-    c_opt, p_opt = optimize_treelet(treelet_leaves)
-    backtrack_optimized_treelet(flat_tree, internal_nodes_indexes, treelet_leaves, p_opt)
-    for n in internal_nodes_indexes:
-        print(flat_tree[n])
-    check_flat_tree(flat_tree)
+        # for n in internal_nodes_indexes:
+        #    print(flat_tree[n])
+        c_opt, p_opt = optimize_treelet(treelet_leaves)
+        backtrack_optimized_treelet(flat_tree, internal_nodes_indexes, treelet_leaves, p_opt)
+        # for n in internal_nodes_indexes:
+        #    print(flat_tree[n])
+        check_flat_tree(flat_tree)
 
     return flat_tree
 
@@ -608,6 +629,12 @@ def check_constraints(point, constraints):
 
 def check_flat_tree(nodes_list: list):
     for node in nodes_list:
+        if node is None:
+            continue
+        lc = node.lc if isinstance(node.lc, Leaf) else nodes_list[node.lc]
+        rc = node.rc if isinstance(node.rc, Leaf) else nodes_list[node.rc]
+        internal_node_from_nodes(lc, rc)
+
         constraints = [[None, None], [None, None], [None, None]]
         for child, left in ((node.lc, 1), (node.rc, 0)):  # left node constrained from right, and vice-versa
             old_dim_constraint = constraints[node.d][left]
@@ -655,7 +682,14 @@ def surface_area(point_a, point_b):
 
 
 def get_bits_from_bitmask(bm):
-    return [int(x) for x in '{:032b}'.format(bm)]
+    result = []
+    i = 0
+    while bm != 0:
+        if 1 == bm & 1:
+            result.append(i)
+        i += 1
+        bm = bm >> 1
+    return result
 
 
 def AABB_from_points(points_list):
@@ -668,29 +702,43 @@ def AABB_from_points(points_list):
             if coord > corner_b[d]:
                 corner_b[d] = coord
     for d in dims:
-        assert(corner_a[d]<=corner_b[d])
+        assert (corner_a[d] <= corner_b[d])
     return tuple(corner_a), tuple(corner_b)
+
+
+def aabb_intersection(a, b):
+    for d in dims:
+        if a[1][d] <= b[0][d]:
+            return False
+        if b[1][d] <= a[0][d]:
+            return False
+    return True
 
 
 def optimize_treelet(treelet):
     L = treelet
     n = len(L)
-    assert (n == 7)
+    assert (n == TREELET_SIZE)
     p_opt = {}
     # Calculate surface area for each subset
     a = empty(2 ** n, dtype=float)
+    aabb_union = {}
     for s in range(1, 2 ** n):
         # Get area union of AABBs
         points_list = []
         for i in get_bits_from_bitmask(s):
             node = L[i]
             points_list.extend(node.aabb)
-        a[s] = surface_area(*AABB_from_points(points_list))
+        aabb = AABB_from_points(points_list)
+        a[s] = surface_area(*aabb)
+        aabb_union[s] = aabb
 
     # Initialize costs of individual leaves
     c_opt = empty(2 ** n, dtype=float)
     for i in range(0, n):
         c_opt[2 ** i] = L[i].sah_cost
+        # print(L[i].sah_cost)
+        # print("LEAF: {0:05b}".format(2**i),  c_opt[2**i])
 
     # Optimize every subset of leaves
     for k in range(2, n + 1):
@@ -702,25 +750,27 @@ def optimize_treelet(treelet):
             assert (p != 0)
             while p != 0:
                 c = c_opt[p] + c_opt[s ^ p]
+                if aabb_intersection(aabb_union[p], aabb_union[s ^ p]):
+                    c = inf
                 # print(p, "{0:8b}".format(p), " {0:8b}".format(s^p))
                 if c < c_s:
                     c_s, p_s = c, p
+                # print ("{0:05b}".format(s), "{0:05b}".format(p), "{0:05b}".format(s^p), c)
                 p = (p - delta) & s
             # Calculate final SAH cost
             # TODO: implement collapsing the treelet into a single leaf
-            c_opt[s] = c_s
+            c_opt[s] = 1.2 * a[s] + c_s
             if p_opt.get(s) is not None:
                 raise
             p_opt[s] = p_s
-        print("len", len(p_opt))
+            # print("OPT:", "{0:05b}".format(s), "{0:05b}".format(p_s), c_opt[s])
 
+    assert (c_opt[2 ** n - 1] != inf)
     return c_opt, p_opt
 
 
 def get_split_by_aabbs(a, b):
     # Returns dimension, position and direction based on the _leftmost_ coordinate of the _rightmost_ box
-    print (a)
-    print (b)
     for d in dims:
         # Straight check
         left_border = a[1][d]
@@ -737,17 +787,14 @@ def get_split_by_aabbs(a, b):
     raise Exception()
 
 
-#print (get_split_by_aabbs(((0.4,0.4,0.4),(0.4,0.4,0.4)),((0.3,0.3,0.3),(0.3,0.3,0.3))))
-#exit(1)
+# print (get_split_by_aabbs(((0.4,0.4,0.4),(0.4,0.4,0.4)),((0.3,0.3,0.3),(0.3,0.3,0.3))))
+# exit(1)
 
 def internal_node_from_nodes(leaf_a, leaf_b):
     aabb = AABB_from_points([*leaf_a.aabb, *leaf_b.aabb])
     aabb_surface = surface_area(*aabb)
     num_points = leaf_a.num_points + leaf_b.num_points
 
-    print ("BLA")
-    print (leaf_a.aabb)
-    print (leaf_b.aabb)
     split_dim, split_position, split_dir = get_split_by_aabbs(leaf_a.aabb, leaf_b.aabb)
     # Is it really necessary?
     left_leaf, right_leaf = (leaf_a, leaf_b) if split_dir > 0 else (leaf_b, leaf_a)
@@ -793,6 +840,7 @@ def backtrack_optimized_treelet(flat_tree, internal_nodes_indexes, treelet_leave
                     # Add the new internal node's index to the new internal nodes stack, reusing old indexes
                     free_ind = internal_nodes_indexes.pop(0)  # Get the next free old index
                     internal_nodes_to_process.append((mask, free_ind))
+    assert (not (internal_nodes_indexes))
 
 
 def main():
@@ -809,7 +857,7 @@ def main():
     # print("{0:64b}".format(get_morton_code((00.0000006*6.1,00.0000006*6.7,0.0000006))))
     # testpoints = [gen_random_point() for _ in xrange(0, 100)]
     # WARNING: we perturbate the points to guarantee that there will be no duplicates
-    testset = normalize_points(random.sample(HAND, 100))
+    testset = normalize_points(random.sample(HAND, 1000))
     # testset = normalize_points(HAND)
     # testset = normalize_points([perturbate_point(p, 0.000001) for p in random.sample(HAND, 10000)])
     # testset = normalize_points(HAND)
