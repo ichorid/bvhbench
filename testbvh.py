@@ -392,7 +392,20 @@ def gen_flat_tree_morton(mpisl, orig_points):
         split_surface_morton_code = morton2point(mpisl[g + 1][1] & split_surface_prefix_mask)
         split_position = split_surface_morton_code[split_dim]
 
-        node_surface_area = surface_area(morton2point(mpisl[i][1]), morton2point(mpisl[j][1]))
+        #left_morton_code = mpisl[min(i, j)][1]
+        #right_morton_code = mpisl[min(i, j)][1]
+        #left_border = morton2point(left_morton_code&split_surface_prefix_mask)
+        #right_border = morton2point((right_morton_code&split_surface_prefix_mask) | ((right_morton_code&split_surface_prefix_mask) -1))
+        #bounding_box = AABB_from_points([left_border, right_border])
+        #print (left_border,right_border)
+
+
+        indices = [mpisl[k][0] for k in range(min(i,j), max(i,j)+1)]
+        bounding_box = AABB_from_points([orig_points[p] for sublist in indices for p in sublist])
+
+        # bounding_box = (left_border, right_border) if j > i else (right_border, left_border)
+
+        node_surface_area = surface_area(*bounding_box)
         # split_length = abs(morton2point(mpisl[i][1])[split_dim] - morton2point(mpisl[j][1])[split_dim])
 
         # if isinstance(left_child, list):
@@ -400,11 +413,6 @@ def gen_flat_tree_morton(mpisl, orig_points):
 
         # if isinstance(right_child, list):
         # leaf_SAH_costs[g + 1] = len(right_child) * abs(right_child[0][split_dim] - split_position) / split_length
-
-        left_border = morton2point(mpisl[i][1])
-        right_border = morton2point(mpisl[j][1])
-        # bounding_box = (left_border, right_border) if j > i else (right_border, left_border)
-        bounding_box = AABB_from_points([left_border, right_border])
 
         lc_num_points = abs(min(i, j) - g) + 1
         rc_num_points = abs(max(i, j) - g) + 1
@@ -429,6 +437,7 @@ def gen_flat_tree_morton(mpisl, orig_points):
                 aabb_surface=node_surface_area,
                 sah_cost=SAH_left + SAH_right
             ))
+        print (i, tree[-1])
         debug_print(i, tree[-1], g, g + 1)
     return tree
 
@@ -570,7 +579,7 @@ def get_treelet_by_top_parent_index(flat_tree, index):
     result_list = [*treelet_leaves, *[n[1] for n in treelet_nodes]]
     assert (len(set(id(t) for t in result_list)) == len(result_list))
     for i in internal_nodes_indexes:
-        assert(i not in [n[1].index for n in treelet_nodes])
+        assert (i not in [n[1].index for n in treelet_nodes])
     return result_list, internal_nodes_indexes
 
 
@@ -590,13 +599,16 @@ def construct_flat_tree(pl):
     flat_tree = gen_flat_tree_morton(morton_points, pl)
     update_SAH_costs(flat_tree)
     check_flat_tree(flat_tree)
+    original_sah_cost = flat_tree[0].sah_cost
 
     for n in flat_tree:
         lc = n.lc if isinstance(n.lc, Leaf) else flat_tree[n.lc]
         rc = n.rc if isinstance(n.rc, Leaf) else flat_tree[n.rc]
         internal_node_from_nodes(lc, rc)
 
-    for i in range(0, len(flat_tree)):
+    inds = list(range(0, len(flat_tree)))
+    random.shuffle(inds)
+    for i in inds:
         treelet_leaves, internal_nodes_indexes = get_treelet_by_top_parent_index(flat_tree, index=i)
         if len(treelet_leaves) < TREELET_SIZE:
             continue
@@ -605,26 +617,52 @@ def construct_flat_tree(pl):
         # for n in internal_nodes_indexes:
         #    print(flat_tree[n])
         c_opt, p_opt = optimize_treelet(treelet_leaves)
+        assert (internal_nodes_indexes[0] == i)
         backtrack_optimized_treelet(flat_tree, internal_nodes_indexes, treelet_leaves, p_opt)
         # for n in internal_nodes_indexes:
         #    print(flat_tree[n])
         check_flat_tree(flat_tree)
 
+    update_SAH_costs(flat_tree)
+    print ("ORIG SAH: ", original_sah_cost)
+    print ("UPDATED SAH: ", flat_tree[0].sah_cost)
     return flat_tree
 
 
 def check_constraints(point, constraints):
-    for d, (coord_l, coord_r) in enumerate(constraints):
+    coord_l, coord_r = constraints
+    for d in dims:
         p = point[d]
         left_ok, right_ok = True, True
-        if coord_l is not None:
-            left_ok = p >= coord_l
-        if coord_r is not None:
-            right_ok = p < coord_r
+        if coord_l[d] is not None:
+            left_ok = p >= coord_l[d]
+        if coord_r[d] is not None:
+            right_ok = p < coord_r[d]
         if not left_ok or not right_ok:
             print("ERROR", point, constraints, (d, coord_l, coord_r))
             return True
     return False
+
+def check_aabbs(parent_aabb, child_aabb):
+    return AABB_from_points([*parent_aabb, *child_aabb]) != parent_aabb
+
+def check_node_constraints(node):
+    constraints = [[None, None, None], [None, None, None]]
+    for child, left in ((node.lc, 1), (node.rc, 0)):  # left node constrained from right, and vice-versa
+        old_dim_constraint = constraints[left][node.d]
+        if old_dim_constraint is not None:
+            if left:
+                assert (node.split < old_dim_constraint)
+            else:
+                assert (node.split >= old_dim_constraint)
+
+        new_constraints = deepcopy(constraints)
+        new_constraints[left][node.d] = node.split
+        if isinstance(child, Leaf):
+            for point in child.points:
+                if check_constraints(point, new_constraints):
+                    print("BAD NODE: ", node)
+                    exit(1)
 
 
 def check_flat_tree(nodes_list: list):
@@ -634,23 +672,12 @@ def check_flat_tree(nodes_list: list):
         lc = node.lc if isinstance(node.lc, Leaf) else nodes_list[node.lc]
         rc = node.rc if isinstance(node.rc, Leaf) else nodes_list[node.rc]
         internal_node_from_nodes(lc, rc)
+        if check_aabbs(node.aabb, AABB_from_points([*lc.aabb, *rc.aabb])):
+            print ("NODE: ", node.index, node.aabb)
+            print ("NODE: ", node.index, AABB_from_points([*lc.aabb, *rc.aabb]))
 
-        constraints = [[None, None], [None, None], [None, None]]
-        for child, left in ((node.lc, 1), (node.rc, 0)):  # left node constrained from right, and vice-versa
-            old_dim_constraint = constraints[node.d][left]
-            if old_dim_constraint is not None:
-                if left:
-                    assert (node.split < old_dim_constraint)
-                else:
-                    assert (node.split >= old_dim_constraint)
+        check_node_constraints(node)
 
-            new_constraints = deepcopy(constraints)
-            new_constraints[node.d][left] = node.split
-            if isinstance(child, Leaf):
-                for point in child.points:
-                    if check_constraints(point, new_constraints):
-                        print(node)
-                        exit(1)
 
 
 def check_binary_tree(node, constraints: list = None):
@@ -708,9 +735,9 @@ def AABB_from_points(points_list):
 
 def aabb_intersection(a, b):
     for d in dims:
-        if a[1][d] <= b[0][d]:
+        if a[1][d] < b[0][d]:
             return False
-        if b[1][d] <= a[0][d]:
+        if b[1][d] < a[0][d]:
             return False
     return True
 
@@ -798,7 +825,7 @@ def internal_node_from_nodes(leaf_a, leaf_b):
     split_dim, split_position, split_dir = get_split_by_aabbs(leaf_a.aabb, leaf_b.aabb)
     # Is it really necessary?
     left_leaf, right_leaf = (leaf_a, leaf_b) if split_dir > 0 else (leaf_b, leaf_a)
-    return Node(lc=left_leaf if isinstance(left_leaf, Leaf) else left_leaf.index,
+    node  = Node(lc=left_leaf if isinstance(left_leaf, Leaf) else left_leaf.index,
                 rc=right_leaf if isinstance(right_leaf, Leaf) else right_leaf.index,
                 num_points=num_points,
                 aabb=aabb,
@@ -807,10 +834,14 @@ def internal_node_from_nodes(leaf_a, leaf_b):
                 d=split_dim,
                 split=split_position,
                 index=-1)
+    check_node_constraints(node)
+    return node
 
 
 def backtrack_optimized_treelet(flat_tree, internal_nodes_indexes, treelet_leaves, p_opt):
     internal_nodes_indexes = copy(internal_nodes_indexes)
+    for x in internal_nodes_indexes:
+        print(" ", flat_tree[x])
     internal_nodes_to_process = [(2 ** len(treelet_leaves) - 1, internal_nodes_indexes.pop(0))]  # Starting from the top
     known_leaves_mask = 0
     processed_nodes_indexes = {}
