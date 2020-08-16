@@ -32,7 +32,7 @@ dim_mask = (int("001" * MORTON_BITS_PER_DIM, 2),
 
 DEBUG = False
 
-TREELET_SIZE = 7
+TREELET_SIZE = 8
 K_BIT_PERMUTATIONS = list(range(0, TREELET_SIZE + 1))
 K_BIT_PERMUTATIONS[0] = []
 for num_ones in range(1, TREELET_SIZE + 1):
@@ -54,6 +54,8 @@ def debug_print(*args, **kwargs):
     if DEBUG:
         print(*args, **kwargs)
 
+
+SEARCH_INVOCATIONS = 0
 
 @attr.s
 class Node:
@@ -105,7 +107,7 @@ def mask_to_index(mask):
     return (64 - clz(mask)) - 1
 
 
-with gzip.open("hand_small.pickle.gz", 'rb') as f:
+with gzip.open("sibenik_small.pickle.gzip", 'rb') as f:
     HAND = pickle.load(f)
 
 
@@ -216,6 +218,8 @@ def find_node_by_point_tree(node, point, depth=-1):
 
 
 def find_node_by_point_tree_flat(nodes_list, point, index, depth=-1):
+    global SEARCH_INVOCATIONS
+    SEARCH_INVOCATIONS = SEARCH_INVOCATIONS + 1
     node = nodes_list[index]
 
     d = node.d
@@ -225,8 +229,8 @@ def find_node_by_point_tree_flat(nodes_list, point, index, depth=-1):
     next_search_node_ind = node.lc if search_left else node.rc
 
     # Leaf found
-    if isinstance(next_search_node_ind, list):
-        return find_node_by_point_linear(next_search_node_ind, point)
+    if isinstance(next_search_node_ind, Leaf):
+        return find_node_by_point_linear(next_search_node_ind.points, point)
         # return tree[0]
 
     best = find_node_by_point_tree_flat(nodes_list, point, next_search_node_ind, depth + 1)
@@ -437,7 +441,6 @@ def gen_flat_tree_morton(mpisl, orig_points):
                 aabb_surface=node_surface_area,
                 sah_cost=SAH_left + SAH_right
             ))
-        print (i, tree[-1])
         debug_print(i, tree[-1], g, g + 1)
     return tree
 
@@ -553,7 +556,7 @@ def construct_binary_tree_by_morton_codes(pl):
 
 def get_treelet_by_top_parent_index(flat_tree, index):
     treelet_leaves = []
-    treelet_nodes = [(1 / flat_tree[index].sah_cost, flat_tree[index])]
+    treelet_nodes = [(1.0 / flat_tree[index].sah_cost, flat_tree[index])]
 
     internal_nodes_indexes = []
 
@@ -568,13 +571,18 @@ def get_treelet_by_top_parent_index(flat_tree, index):
         else:
             if left_is_leaf:
                 treelet_leaves.append(lc)
-                heappush(treelet_nodes, (1 / rc.sah_cost, rc))
+                heappush(treelet_nodes, (1.0 / rc.sah_cost, rc))
             elif right_is_leaf:
                 treelet_leaves.append(rc)
-                heappush(treelet_nodes, (1 / lc.sah_cost, lc))
+                heappush(treelet_nodes, (1.0 / lc.sah_cost, lc))
             else:
-                heappush(treelet_nodes, (1 / lc.sah_cost, lc))
-                heappush(treelet_nodes, (1 / rc.sah_cost, rc))
+                debug_print(lc.sah_cost)
+                if (not lc.sah_cost >0.0):
+                    print ("PSAH", repr(lc.sah_cost))
+                    print (lc)
+                assert (lc.sah_cost > 0.0)
+                heappush(treelet_nodes, (1.0 / lc.sah_cost, lc))
+                heappush(treelet_nodes, (1.0 / rc.sah_cost, rc))
 
     result_list = [*treelet_leaves, *[n[1] for n in treelet_nodes]]
     assert (len(set(id(t) for t in result_list)) == len(result_list))
@@ -593,18 +601,7 @@ def update_SAH_costs(flat_tree, index=0):
     node.sah_cost = sah_node
     return sah_node
 
-
-def construct_flat_tree(pl):
-    morton_points = convert_points_to_morton_codes(pl)
-    flat_tree = gen_flat_tree_morton(morton_points, pl)
-    update_SAH_costs(flat_tree)
-    check_flat_tree(flat_tree)
-    original_sah_cost = flat_tree[0].sah_cost
-
-    for n in flat_tree:
-        lc = n.lc if isinstance(n.lc, Leaf) else flat_tree[n.lc]
-        rc = n.rc if isinstance(n.rc, Leaf) else flat_tree[n.rc]
-        internal_node_from_nodes(lc, rc)
+def optimize_with_treelets(flat_tree):
 
     inds = list(range(0, len(flat_tree)))
     random.shuffle(inds)
@@ -612,7 +609,7 @@ def construct_flat_tree(pl):
         treelet_leaves, internal_nodes_indexes = get_treelet_by_top_parent_index(flat_tree, index=i)
         if len(treelet_leaves) < TREELET_SIZE:
             continue
-        print(i)
+        #print(i)
 
         # for n in internal_nodes_indexes:
         #    print(flat_tree[n])
@@ -621,9 +618,25 @@ def construct_flat_tree(pl):
         backtrack_optimized_treelet(flat_tree, internal_nodes_indexes, treelet_leaves, p_opt)
         # for n in internal_nodes_indexes:
         #    print(flat_tree[n])
-        check_flat_tree(flat_tree)
+        #check_flat_tree(flat_tree)
 
     update_SAH_costs(flat_tree)
+
+def construct_flat_tree(pl):
+    morton_points = convert_points_to_morton_codes(pl)
+    flat_tree = gen_flat_tree_morton(morton_points, pl)
+    update_SAH_costs(flat_tree)
+    #check_flat_tree(flat_tree)
+    original_sah_cost = flat_tree[0].sah_cost
+
+    if DEBUG:
+        for n in flat_tree:
+            lc = n.lc if isinstance(n.lc, Leaf) else flat_tree[n.lc]
+            rc = n.rc if isinstance(n.rc, Leaf) else flat_tree[n.rc]
+            internal_node_from_nodes(lc, rc)
+
+    optimize_with_treelets(flat_tree)
+
     print ("ORIG SAH: ", original_sah_cost)
     print ("UPDATED SAH: ", flat_tree[0].sah_cost)
     return flat_tree
@@ -840,8 +853,8 @@ def internal_node_from_nodes(leaf_a, leaf_b):
 
 def backtrack_optimized_treelet(flat_tree, internal_nodes_indexes, treelet_leaves, p_opt):
     internal_nodes_indexes = copy(internal_nodes_indexes)
-    for x in internal_nodes_indexes:
-        print(" ", flat_tree[x])
+    #for x in internal_nodes_indexes:
+    #    print(" ", flat_tree[x])
     internal_nodes_to_process = [(2 ** len(treelet_leaves) - 1, internal_nodes_indexes.pop(0))]  # Starting from the top
     known_leaves_mask = 0
     processed_nodes_indexes = {}
@@ -888,12 +901,12 @@ def main():
     # print("{0:64b}".format(get_morton_code((00.0000006*6.1,00.0000006*6.7,0.0000006))))
     # testpoints = [gen_random_point() for _ in xrange(0, 100)]
     # WARNING: we perturbate the points to guarantee that there will be no duplicates
-    testset = normalize_points(random.sample(HAND, 1000))
+    testset = normalize_points([perturbate_point(p, 0.0001) for p in random.sample(HAND, 1000)])
     # testset = normalize_points(HAND)
     # testset = normalize_points([perturbate_point(p, 0.000001) for p in random.sample(HAND, 10000)])
     # testset = normalize_points(HAND)
     # testset = HAND
-    testpoints = [perturbate_point(p, 0.0) for p in random.sample(testset, 100)]
+    testpoints = [perturbate_point(p, 0.0) for p in random.sample(testset, 1000)]
 
     point_search_results = []
 
@@ -931,14 +944,13 @@ def main():
     end = timer()
     print("time to build ", (end - start))
 
-    return
 
     # mortonized_points_sorted = sorted(mortonized_points)
     # m_point = mortonized_points_sorted[find_nearest_neighbor_morton(mortonized_points_sorted, testpoints[10])]
     # print(mortonized_points.index(m_point))
     start = timer()
     morton_results = []
-    for test_point in testpoints[:100]:
+    for test_point in testpoints[:1000]:
         morton_results.append(find_node_by_point_tree_flat(flat_tree, test_point, 0))
         # morton_results.append(find_node_by_point_tree(morton_tree, test_point))
     point_search_results.append(morton_results)
@@ -951,8 +963,9 @@ def main():
         print(testpoints[res])
         for c in point_search_results:
             print(c[res])
-        print("\n")
+        print("")
 
+    print ("Total search invocations:", SEARCH_INVOCATIONS)
     # start = timer()
     # for test_point in testpoints:
     #    found_point_linear = find_node_by_point_linear(testset, test_point)
